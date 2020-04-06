@@ -23,7 +23,7 @@ const (
 	defaultRPCAddr     = "localhost:5757"
 	defaultRPCCertFile = "rpc.cert"
 	defaultRPCKeyFile  = "rpc.key"
-	defaultWebAddr     = "localhost:5758"
+	defaultWebAddr     = "0.0.0.0:5758"
 	configFilename     = "dexc.conf"
 	certsFilename      = "certs.json"
 	defaultLogLevel    = "info"
