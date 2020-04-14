@@ -20,7 +20,7 @@ import (
 
 const (
 	maxLogRolls        = 16
-	defaultRPCAddr     = "localhost:5757"
+	defaultRPCAddr     = "0.0.0.0:5757"
 	defaultRPCCertFile = "rpc.cert"
 	defaultRPCKeyFile  = "rpc.key"
 	defaultWebAddr     = "0.0.0.0:5758"

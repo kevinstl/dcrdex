@@ -36,7 +36,7 @@ const (
 	defaultPGUser              = "dcrdex"
 	defaultPGDBName            = "dcrdex"
 	defaultDEXPrivKeyFilename  = "dexprivkey"
-	defaultRPCHost             = "0.0.0.0"
+	defaultRPCHost             = "127.0.0.1"
 	defaultRPCPort             = "7232"
 
 	defaultCancelThresh     = 0.6
