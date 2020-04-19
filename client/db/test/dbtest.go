@@ -19,6 +19,14 @@ func randomPubKey() *secp256k1.PublicKey {
 	return pub
 }
 
+func randString(maxLen int) string {
+	s := string(randBytes(int(randBytes(1)[0])))
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return s
+}
+
 // RandomAccountInfo creates an AccountInfo with random values.
 func RandomAccountInfo() *db.AccountInfo {
 	return &db.AccountInfo{
@@ -26,6 +34,7 @@ func RandomAccountInfo() *db.AccountInfo {
 		EncKey:    randBytes(32),
 		DEXPubKey: randomPubKey(),
 		FeeCoin:   randBytes(32),
+		Cert:      randBytes(100),
 	}
 }
 
@@ -105,6 +114,17 @@ func RandomMatchProof(sparsity float64) *db.MatchProof {
 		proof.Auth.RedemptionStamp = rand.Uint64()
 	}
 	return proof
+}
+
+func RandomNotification(maxTime uint64) *db.Notification {
+	return &db.Notification{
+		NoteType:    randString(25),
+		SubjectText: randString(255),
+		DetailText:  randString(255),
+		// Since this is for DB tests, only use severity level >= Success.
+		Severeness: db.Severity(rand.Intn(3)) + db.Success,
+		TimeStamp:  uint64(rand.Int63n(int64(maxTime))),
+	}
 }
 
 type testKiller interface {
@@ -225,5 +245,26 @@ func MustCompareWallets(t testKiller, w1, w2 *db.Wallet) {
 	}
 	if !bytes.Equal(w1.EncryptedPW, w2.EncryptedPW) {
 		t.Fatalf("EncryptedPW mismatch. %x != %x", w1.EncryptedPW, w2.EncryptedPW)
+	}
+}
+
+func MustCompareNotifications(t testKiller, n1, n2 *db.Notification) {
+	if n1.NoteType != n2.NoteType {
+		t.Fatalf("NoteType mismatch. %s != %s", n1.NoteType, n2.NoteType)
+	}
+	if n1.SubjectText != n2.SubjectText {
+		t.Fatalf("SubjectText mismatch. %s != %s", n1.SubjectText, n2.SubjectText)
+	}
+	if n1.DetailText != n2.DetailText {
+		t.Fatalf("DetailText mismatch. %s != %s", n1.DetailText, n2.DetailText)
+	}
+	if n1.Severeness != n2.Severeness {
+		t.Fatalf("Severeness mismatch. %d != %d", n1.Severeness, n2.Severeness)
+	}
+	if n1.TimeStamp != n2.TimeStamp {
+		t.Fatalf("TimeStamp mismatch. %d != %d", n1.TimeStamp, n2.TimeStamp)
+	}
+	if n1.ID().String() != n2.ID().String() {
+		t.Fatalf("ID mismatch. %s != %s", n1.ID(), n2.ID())
 	}
 }

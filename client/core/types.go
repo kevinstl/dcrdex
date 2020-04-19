@@ -4,13 +4,11 @@
 package core
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/client/db"
@@ -45,7 +43,7 @@ func (set *errorSet) addErr(err error) *errorSet {
 }
 
 // If any returns the error set if there are any errors, else nil.
-func (set *errorSet) ifany() *errorSet {
+func (set *errorSet) ifany() error {
 	if len(set.errs) > 0 {
 		return set
 	}
@@ -98,105 +96,18 @@ type SupportedAsset struct {
 	Info   *asset.WalletInfo `json:"info"`
 }
 
-// xcWallet is a wallet.
-type xcWallet struct {
-	asset.Wallet
-	connector *dex.ConnectionMaster
-	AssetID   uint32
-	mtx       sync.RWMutex
-	lockTime  time.Time
-	hookedUp  bool
-	balance   uint64
-	balUpdate time.Time
-	encPW     []byte
-	address   string
-}
-
-// Unlock unlocks the wallet.
-func (w *xcWallet) Unlock(pw string, dur time.Duration) error {
-	err := w.Wallet.Unlock(pw, dur)
-	if err != nil {
-		return err
-	}
-	w.mtx.Lock()
-	w.lockTime = time.Now().Add(dur)
-	w.mtx.Unlock()
-	return nil
-}
-
-// lock the wallet, setting the lockTime to the time when the wallet will be
-// locked.
-func (w *xcWallet) lock() error {
-	w.mtx.Lock()
-	w.lockTime = time.Time{}
-	w.mtx.Unlock()
-	return w.Lock()
-}
-
-// unlocked will return true if the lockTime has not passed.
-func (w *xcWallet) unlocked() bool {
-	w.mtx.RLock()
-	defer w.mtx.RUnlock()
-	return w.lockTime.After(time.Now())
-}
-
-// state returns the current WalletState.
-func (w *xcWallet) state() *WalletState {
-	w.mtx.RLock()
-	defer w.mtx.RUnlock()
-	winfo := w.Info()
-	return &WalletState{
-		Symbol:  unbip(w.AssetID),
-		AssetID: w.AssetID,
-		Open:    w.lockTime.After(time.Now()),
-		Running: w.connector.On(),
-		Balance: w.balance,
-		Address: w.address,
-		FeeRate: winfo.FeeRate, // Withdraw fee, not swap.
-		Units:   winfo.Units,
-	}
-}
-
-// setBalance sets the wallet balance.
-func (w *xcWallet) setBalance(bal uint64) {
-	w.mtx.Lock()
-	w.balance = bal
-	w.balUpdate = time.Now()
-	w.mtx.Unlock()
-}
-
-// setAddress sets the wallet's deposit address.
-func (w *xcWallet) setAddress(addr string) {
-	w.mtx.Lock()
-	w.address = addr
-	w.mtx.Unlock()
-}
-
-// connected is true if the wallet has already been connected.
-func (w *xcWallet) connected() bool {
-	w.mtx.RLock()
-	defer w.mtx.RUnlock()
-	return w.hookedUp
-}
-
-// Connect calls the dex.Connector's Connect method and sets the
-// xcWallet.hookedUp flag.
-func (w *xcWallet) Connect(ctx context.Context) error {
-	err := w.connector.Connect(ctx)
-	if err != nil {
-		return err
-	}
-	w.mtx.Lock()
-	w.hookedUp = true
-	w.mtx.Unlock()
-	return nil
-}
-
 // Registration is information necessary to register an account on a DEX.
 type Registration struct {
-	DEX      string
+	URL      string
 	Password string
 	Fee      uint64
+	Cert     string
+}
+
+// PreRegisterForm is the information necessary to pre-register a DEX.
+type PreRegisterForm struct {
+	URL  string `json:"url"`
+	Cert string `json:"cert"`
 }
 
 // Match represents a match on an order. An order may have many matches.
@@ -210,6 +121,8 @@ type Match struct {
 // Order is core's general type for an order. An order may be a market, limit,
 // or cancel order. Some fields are only relevant to particular order types.
 type Order struct {
+	DEX         string            `json:"dex"`
+	MarketID    string            `json:"market"`
 	Type        order.OrderType   `json:"type"`
 	ID          string            `json:"id"`
 	Stamp       uint64            `json:"stamp"`
@@ -218,6 +131,7 @@ type Order struct {
 	Filled      uint64            `json:"filled"`
 	Matches     []*Match          `json:"matches"`
 	Cancelling  bool              `json:"cancelling"`
+	Canceled    bool              `json:"canceled"`
 	Rate        uint64            `json:"rate"`               // limit only
 	TimeInForce order.TimeInForce `json:"tif"`                // limit only
 	TargetID    string            `json:"targetID,omitempty"` // cancel only
@@ -241,9 +155,9 @@ func (m *Market) Display() string {
 	return newDisplayIDFromSymbols(m.BaseSymbol, m.QuoteSymbol)
 }
 
-// sid is a simpler string ID constructed from the asset IDs.
-func (m *Market) sid() string {
-	return sid(m.BaseID, m.QuoteID)
+// mktID is a string ID constructed from the asset IDs.
+func (m *Market) mktID() string {
+	return mktID(m.BaseID, m.QuoteID)
 }
 
 // Exchange represents a single DEX with any number of markets.
@@ -313,6 +227,7 @@ type dexAccount struct {
 	id        account.AccountID
 	dexPubKey *secp256k1.PublicKey
 	feeCoin   []byte
+	cert      []byte
 	isPaid    bool
 	authMtx   sync.RWMutex
 	isAuthed  bool
@@ -326,6 +241,7 @@ func newDEXAccount(acctInfo *db.AccountInfo) *dexAccount {
 		dexPubKey: acctInfo.DEXPubKey,
 		isPaid:    acctInfo.Paid,
 		feeCoin:   acctInfo.FeeCoin,
+		cert:      acctInfo.Cert,
 	}
 }
 
@@ -442,7 +358,7 @@ type TradeForm struct {
 	TifNow  bool   `json:"tifnow"`
 }
 
-// sid is a string ID constructed from the asset IDs.
-func sid(b, q uint32) string {
+// mktID is a string ID constructed from the asset IDs.
+func mktID(b, q uint32) string {
 	return strconv.Itoa(int(b)) + "-" + strconv.Itoa(int(q))
 }

@@ -12,11 +12,14 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strings"
+	"sync"
 
+	"decred.org/dcrdex/server/admin"
 	_ "decred.org/dcrdex/server/asset/btc" // register btc asset
 	_ "decred.org/dcrdex/server/asset/dcr" // register dcr asset
 	_ "decred.org/dcrdex/server/asset/ltc" // register ltc asset
 	dexsrv "decred.org/dcrdex/server/dex"
+	"github.com/decred/dcrd/dcrec/secp256k1/v2"
 )
 
 func mainCore(ctx context.Context) error {
@@ -31,6 +34,15 @@ func mainCore(ctx context.Context) error {
 			logRotator.Close()
 		}
 	}()
+
+	// Acquire admin server password if enabled.
+	var adminSrvAuthSHA [32]byte
+	if cfg.AdminSrvOn {
+		adminSrvAuthSHA, err = admin.PasswordHashPrompt("Admin interface password: ")
+		if err != nil {
+			return fmt.Errorf("cannot use password: %v", err)
+		}
+	}
 
 	if opts.CPUProfile != "" {
 		var f *os.File
@@ -67,6 +79,20 @@ func mainCore(ctx context.Context) error {
 	log.Infof("Found %d assets, loaded %d markets, for network %s",
 		len(assets), len(markets), strings.ToUpper(cfg.Network.String()))
 
+	// Load, or create and save, the DEX signing key.
+	var privKey *secp256k1.PrivateKey
+	{
+		keyPW, err := admin.PasswordPrompt("Signing key password: ")
+		if err != nil {
+			return fmt.Errorf("cannot use password: %v", err)
+		}
+		privKey, err = dexKey(cfg.DEXPrivKeyPath, keyPW)
+		if err != nil {
+			return err
+		}
+		admin.ClearBytes(keyPW)
+	}
+
 	// Create the DEX manager.
 	dexConf := &dexsrv.DexConf{
 		LogBackend: cfg.LogMaker,
@@ -74,18 +100,20 @@ func mainCore(ctx context.Context) error {
 		Assets:     assets,
 		Network:    cfg.Network,
 		DBConf: &dexsrv.DBConf{
-			DBName: cfg.DBName,
-			Host:   cfg.DBHost,
-			User:   cfg.DBUser,
-			Port:   cfg.DBPort,
-			Pass:   cfg.DBPass,
+			DBName:       cfg.DBName,
+			Host:         cfg.DBHost,
+			User:         cfg.DBUser,
+			Port:         cfg.DBPort,
+			Pass:         cfg.DBPass,
+			ShowPGConfig: cfg.ShowPGConfig,
 		},
 		RegFeeXPub:       cfg.RegFeeXPub,
 		RegFeeAmount:     cfg.RegFeeAmount,
 		RegFeeConfirms:   cfg.RegFeeConfirms,
 		BroadcastTimeout: cfg.BroadcastTimeout,
 		CancelThreshold:  cfg.CancelThreshold,
-		DEXPrivKey:       cfg.DEXPrivKey,
+		Anarchy:          cfg.Anarchy,
+		DEXPrivKey:       privKey,
 		CommsCfg: &dexsrv.RPCConfig{
 			RPCCert:     cfg.RPCCert,
 			RPCKey:      cfg.RPCKey,
@@ -98,8 +126,30 @@ func mainCore(ctx context.Context) error {
 		return err
 	}
 
+	var wg sync.WaitGroup
+	if cfg.AdminSrvOn {
+		srvCFG := &admin.SrvConfig{
+			Core:    dexMan,
+			Addr:    cfg.AdminSrvAddr,
+			AuthSHA: adminSrvAuthSHA,
+			Cert:    cfg.RPCCert,
+			Key:     cfg.RPCKey,
+		}
+		adminServer, err := admin.NewSrv(srvCFG)
+		if err != nil {
+			return fmt.Errorf("cannot set up admin server: %v", err)
+		}
+		wg.Add(1)
+		go func() {
+			adminServer.Run(ctx)
+			wg.Done()
+		}()
+	}
+
 	log.Info("The DEX is running. Hit CTRL+C to quit...")
 	<-ctx.Done()
+	// Wait for the admin server to finish.
+	wg.Wait()
 
 	log.Info("Stopping DEX...")
 	dexMan.Stop()
@@ -118,7 +168,7 @@ func main() {
 
 	err := mainCore(ctx)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	os.Exit(0)

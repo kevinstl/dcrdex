@@ -39,11 +39,12 @@ type AssetConf struct {
 
 // DBConf groups the database configuration parameters.
 type DBConf struct {
-	DBName string
-	User   string
-	Pass   string
-	Host   string
-	Port   uint16
+	DBName       string
+	User         string
+	Pass         string
+	Host         string
+	Port         uint16
+	ShowPGConfig bool
 }
 
 // RPCConfig is an alias for the comms Server's RPC config struct.
@@ -95,6 +96,7 @@ type DexConf struct {
 	RegFeeAmount     uint64
 	BroadcastTimeout time.Duration
 	CancelThreshold  float64
+	Anarchy          bool
 	DEXPrivKey       *secp256k1.PrivateKey
 	CommsCfg         *RPCConfig
 }
@@ -195,6 +197,11 @@ func (dm *DEX) handleDEXConfig(conn comms.Link, msg *msgjson.Message) *msgjson.E
 //  8. Create and start the book router, and create the order router.
 //  9. Create and start the comms server.
 func NewDEX(cfg *DexConf) (*DEX, error) {
+	// Disallow running without user penalization in a mainnet config.
+	if cfg.Anarchy && cfg.Network == dex.Mainnet {
+		return nil, fmt.Errorf("User penalties may not be disabled on mainnet.")
+	}
+
 	var stopWaiters []subsystem
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -309,7 +316,7 @@ func NewDEX(cfg *DexConf) (*DEX, error) {
 		User:         cfg.DBConf.User,
 		Pass:         cfg.DBConf.Pass,
 		DBName:       cfg.DBConf.DBName,
-		HidePGConfig: false,
+		ShowPGConfig: cfg.DBConf.ShowPGConfig,
 		QueryTimeout: 20 * time.Minute,
 		MarketCfg:    cfg.Markets,
 		//CheckedStores: true,
@@ -329,6 +336,7 @@ func NewDEX(cfg *DexConf) (*DEX, error) {
 		FeeConfs:        cfg.RegFeeConfirms,
 		FeeChecker:      dcrBackend.UnspentCoinDetails,
 		CancelThreshold: cfg.CancelThreshold,
+		Anarchy:         cfg.Anarchy,
 	}
 
 	authMgr := auth.NewAuthManager(&authCfg)
@@ -420,4 +428,9 @@ func NewDEX(cfg *DexConf) (*DEX, error) {
 	comms.Route(msgjson.ConfigRoute, dexMgr.handleDEXConfig)
 
 	return dexMgr, nil
+}
+
+// Config returns the current dex configuration.
+func (dm *DEX) Config() json.RawMessage {
+	return dm.config.configEnc
 }

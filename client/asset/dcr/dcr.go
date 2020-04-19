@@ -62,7 +62,7 @@ type rpcClient interface {
 	ListUnspentMin(minConf int) ([]walletjson.ListUnspentResult, error)
 	LockUnspent(unlock bool, ops []*wire.OutPoint) error
 	GetRawChangeAddress(account string, net dcrutil.AddressParams) (dcrutil.Address, error)
-	GetNewAddress(account string, net dcrutil.AddressParams) (dcrutil.Address, error)
+	GetNewAddressGapPolicy(string, rpcclient.GapPolicy, dcrutil.AddressParams) (dcrutil.Address, error)
 	SignRawTransaction(tx *wire.MsgTx) (*wire.MsgTx, bool, error)
 	DumpPrivKey(address dcrutil.Address, net [2]byte) (*dcrutil.WIF, error)
 	GetTransaction(txHash *chainhash.Hash) (*walletjson.GetTransactionResult, error)
@@ -406,6 +406,10 @@ func (dcr *ExchangeWallet) fund(confs uint32,
 
 out:
 	for {
+		// If there are none left, we don't have enough.
+		if len(utxos) == 0 {
+			return nil, 0, 0, fmt.Errorf("not enough to cover requested funds")
+		}
 		// On each loop, find the smallest UTXO that is enough. If no UTXO is large
 		// enough, add the largest and continue.
 		var txout *compositeUTXO
@@ -425,10 +429,6 @@ out:
 		}
 		// Pop the utxo from the unspents
 		utxos = utxos[:len(utxos)-1]
-		// If there are none left, we don't have enough.
-		if len(utxos) == 0 {
-			return nil, 0, 0, fmt.Errorf("not enough to cover requested funds")
-		}
 	}
 
 	err = dcr.lockFundingCoins(spents)
@@ -565,7 +565,7 @@ func (dcr *ExchangeWallet) Swap(swaps *asset.Swaps, nfo *dex.Asset) ([]asset.Rec
 		totalOut += contract.Value
 		// revokeAddr is the address that will receive the refund if the contract is
 		// abandoned.
-		revokeAddr, err := dcr.node.GetNewAddress(dcr.acct, chainParams)
+		revokeAddr, err := dcr.node.GetNewAddressGapPolicy(dcr.acct, rpcclient.GapPolicyIgnore, chainParams)
 		if err != nil {
 			return nil, nil, fmt.Errorf("error creating revocation address: %v", err)
 		}
@@ -1000,13 +1000,13 @@ func (dcr *ExchangeWallet) Refund(receipt asset.Receipt, nfo *dex.Asset) error {
 		return fmt.Errorf("refund tx not worth the fees")
 	}
 
-	refundAddr, err := dcr.node.GetRawChangeAddress(dcr.acct, chainParams)
+	refundAddr, err := dcr.node.GetNewAddressGapPolicy(dcr.acct, rpcclient.GapPolicyIgnore, chainParams)
 	if err != nil {
 		return fmt.Errorf("error getting new address from the wallet: %v", err)
 	}
 	pkScript, err := txscript.PayToAddrScript(refundAddr)
 	if err != nil {
-		return fmt.Errorf("error creating refund script for address '%s': %v", refundAddr, err)
+		return fmt.Errorf("error creating refund script for address '%v': %v", refundAddr, err)
 	}
 	txOut := wire.NewTxOut(int64(val-fee), pkScript)
 	// One last check for dust.
@@ -1039,7 +1039,7 @@ func (dcr *ExchangeWallet) Refund(receipt asset.Receipt, nfo *dex.Asset) error {
 
 // Address returns an address for the exchange wallet.
 func (dcr *ExchangeWallet) Address() (string, error) {
-	addr, err := dcr.node.GetNewAddress(dcr.acct, chainParams)
+	addr, err := dcr.node.GetNewAddressGapPolicy(dcr.acct, rpcclient.GapPolicyIgnore, chainParams)
 	if err != nil {
 		return "", err
 	}
@@ -1322,10 +1322,6 @@ func (dcr *ExchangeWallet) sendWithReturn(baseTx *wire.MsgTx,
 	size := msgTx.SerializeSize()
 	minFee := feeRate * uint64(size)
 	remaining := totalIn - totalOut
-	if minFee > remaining {
-		return nil, nil, fmt.Errorf("not enough funds to cover minimum fee rate. %d < %d",
-			totalIn, minFee+totalOut)
-	}
 	lastFee := remaining
 	// Create the change output.
 	changeScript, err := txscript.PayToAddrScript(addr)
@@ -1344,7 +1340,11 @@ func (dcr *ExchangeWallet) sendWithReturn(baseTx *wire.MsgTx,
 	} else {
 		reservoir = uint64(subtractee.Value)
 	}
-	isDust := dexdcr.IsDust(changeOutput, feeRate)
+	if minFee > reservoir {
+		return nil, nil, fmt.Errorf("not enough funds to cover minimum fee rate. %d < %d",
+			minFee, reservoir)
+	}
+	isDust := dexdcr.IsDust(subtractee, feeRate)
 	sigCycles := 0
 	if !isDust {
 		// Add the change output.

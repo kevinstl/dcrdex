@@ -214,6 +214,20 @@ func (testNode) GetBlockHash(blockHeight int64) (*chainhash.Hash, error) {
 	return hash, nil
 }
 
+// Part of the dcrNode interface.
+func (testNode) GetBestBlockHash() (*chainhash.Hash, error) {
+	if len(testChain.hashes) == 0 {
+		return nil, fmt.Errorf("no blocks in testChain")
+	}
+	var bestHeight int64
+	for height := range testChain.hashes {
+		if height > bestHeight {
+			bestHeight = height
+		}
+	}
+	return testChain.hashes[bestHeight], nil
+}
+
 // Create a chainjson.GetTxOutResult such as is returned from GetTxOut.
 func testGetTxOut(confirmations int64, pkScript []byte) *chainjson.GetTxOutResult {
 	return &chainjson.GetTxOutResult{
@@ -855,8 +869,8 @@ func TestUTXOs(t *testing.T) {
 		t.Fatalf("case 7 - received error before reorg")
 	}
 	betterHash := testAddBlockVerbose(nil, 1, txHeight, 1)
-	dcr.anyQ <- betterHash
-	time.Sleep(time.Millisecond * 50)
+	dcr.blockCache.add(testChain.blocks[*betterHash])
+	dcr.blockCache.reorg(int64(txHeight))
 	// Remove the txout from the blockchain, since dcrd would no longer return it.
 	delete(testChain.txOuts, txOutID(txHash, msg.vout))
 	_, err = utxo.Confirmations()
@@ -877,27 +891,27 @@ func TestUTXOs(t *testing.T) {
 	}
 	// Now orphan the block, by doing a reorg.
 	betterHash = testAddBlockVerbose(nil, 1, txHeight, 1)
-	dcr.anyQ <- betterHash
-	time.Sleep(time.Millisecond * 50)
+	dcr.blockCache.reorg(int64(txHeight))
+	dcr.blockCache.add(testChain.blocks[*betterHash])
 	testAddTxOut(msg.tx, msg.vout, txHash, betterHash, int64(txHeight), 1)
 	_, err = utxo.Confirmations()
 	if err != nil {
-		t.Fatalf("case 8 - unexpected error after reorg")
+		t.Fatalf("case 8 - unexpected error after reorg: %v", err)
 	}
 	if utxo.blockHash != *betterHash {
 		t.Fatalf("case 8 - unexpected hash for utxo after reorg")
 	}
 	// Do it again, but this time, put the utxo into mempool.
 	evenBetter := testAddBlockVerbose(nil, 1, txHeight, 1)
-	dcr.anyQ <- evenBetter
-	time.Sleep(time.Millisecond * 50)
+	dcr.blockCache.reorg(int64(txHeight))
+	dcr.blockCache.add(testChain.blocks[*evenBetter])
 	testAddTxOut(msg.tx, msg.vout, txHash, evenBetter, 0, 0)
 	_, err = utxo.Confirmations()
 	if err != nil {
 		t.Fatalf("case 8 - unexpected error for mempool tx after reorg")
 	}
 	if utxo.height != 0 {
-		t.Fatalf("case 10 - unexpected height %d after dumping into mempool", utxo.height)
+		t.Fatalf("case 8 - unexpected height %d after dumping into mempool", utxo.height)
 	}
 
 	// CASE 9: A UTXO with a pay-to-script-hash for a 1-of-2 multisig redeem
@@ -1162,8 +1176,8 @@ func TestReorg(t *testing.T) {
 	// Add a replacement blocks
 	newHash := testAddBlockVerbose(nil, 1, uint32(tipHeight), 1)
 	// Passing the hash to anyQ triggers the reorganization.
-	dcr.anyQ <- newHash
-	time.Sleep(time.Millisecond * 50)
+	dcr.blockCache.reorg(int64(tipHeight))
+	dcr.blockCache.add(testChain.blocks[*newHash])
 	ensureOrphaned(tipHash, tipHeight)
 	newTip, found := dcr.blockCache.mainchain[uint32(tipHeight)]
 	if !found {
@@ -1182,8 +1196,8 @@ func TestReorg(t *testing.T) {
 		t.Fatalf("not all block found for 3-block reorg (%t, %t, %t)", found1, found2, found3)
 	}
 	newHash = testAddBlockVerbose(nil, 1, uint32(tipHeight-2), 1)
-	dcr.anyQ <- newHash
-	time.Sleep(time.Millisecond * 50)
+	dcr.blockCache.reorg(int64(tipHeight - 2))
+	dcr.blockCache.add(testChain.blocks[*newHash])
 	ensureOrphaned(&tip.hash, int(tip.height))
 	ensureOrphaned(&oneDeep.hash, int(tip.height))
 	ensureOrphaned(&twoDeep.hash, int(tip.height))
@@ -1234,7 +1248,13 @@ func TestAuxiliary(t *testing.T) {
 	confs := int64(3)
 	txout := testAddTxOut(msg.tx, 0, txHash, blockHash, int64(txHeight), confs)
 	txout.Value = 8
-	scriptAddrs, _ := dexdcr.ExtractScriptAddrs(msg.tx.TxOut[0].PkScript, chainParams)
+	scriptAddrs, nonStandard, err := dexdcr.ExtractScriptAddrs(msg.tx.TxOut[0].PkScript, chainParams)
+	if err != nil {
+		t.Fatalf("ExtractScriptAddrs error: %v", err)
+	}
+	if nonStandard {
+		t.Errorf("vote output 0 was non-standard")
+	}
 	addr := scriptAddrs.PkHashes[0].String()
 	txAddr, v, confs, err := dcr.UnspentCoinDetails(toCoinID(txHash, 0))
 	if err != nil {
@@ -1275,5 +1295,52 @@ func TestCheckAddress(t *testing.T) {
 		if dcr.CheckAddress(test.addr) != !test.wantErr {
 			t.Fatalf("wantErr = %t, address = %s", test.wantErr, test.addr)
 		}
+	}
+}
+
+func TestDriver_DecodeCoinID(t *testing.T) {
+	tests := []struct {
+		name    string
+		coinID  []byte
+		want    string
+		wantErr bool
+	}{
+		{
+			"ok",
+			[]byte{
+				0x16, 0x8f, 0x34, 0x3a, 0xdf, 0x17, 0xe0, 0xc3,
+				0xa2, 0xe8, 0x88, 0x79, 0x8, 0x87, 0x17, 0xb8,
+				0xac, 0x93, 0x47, 0xb9, 0x66, 0xd, 0xa7, 0x4b,
+				0xde, 0x3e, 0x1d, 0x1f, 0x47, 0x94, 0x9f, 0xdf, // 32 byte hash
+				0x0, 0x0, 0x0, 0x1, // 4 byte vout
+			},
+			"df9f94471f1d3ede4ba70d66b94793acb81787087988e8a2c3e017df3a348f16:1",
+			false,
+		},
+		{
+			"bad",
+			[]byte{
+				0x16, 0x8f, 0x34, 0x3a, 0xdf, 0x17, 0xe0, 0xc3,
+				0xa2, 0xe8, 0x88, 0x79, 0x8, 0x87, 0x17, 0xb8,
+				0xac, 0x93, 0x47, 0xb9, 0x66, 0xd, 0xa7, 0x4b,
+				0xde, 0x3e, 0x1d, 0x1f, 0x47, 0x94, 0x9f, // 31 bytes
+				0x0, 0x0, 0x0, 0x1,
+			},
+			"",
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Driver{}
+			got, err := d.DecodeCoinID(tt.coinID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Driver.DecodeCoinID() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("Driver.DecodeCoinID() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

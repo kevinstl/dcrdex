@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"decred.org/dcrdex/client/core"
+	"decred.org/dcrdex/client/db"
 	"decred.org/dcrdex/dex"
 )
 
@@ -24,18 +25,13 @@ func simpleAck() *standardResponse {
 	}
 }
 
-// preRegisterForm is the information necessary to pre-register a DEX.
-type preRegisterForm struct {
-	DEX string `json:"dex"`
-}
-
 // apiPreRegister is the handler for the '/preregister' API request.
 func (s *WebServer) apiPreRegister(w http.ResponseWriter, r *http.Request) {
-	form := new(preRegisterForm)
+	form := new(core.PreRegisterForm)
 	if !readPost(w, r, form) {
 		return
 	}
-	fee, err := s.core.PreRegister(form.DEX)
+	fee, err := s.core.PreRegister(form)
 	if err != nil {
 		s.writeAPIError(w, "preregister error: %v", err)
 		return
@@ -52,7 +48,7 @@ func (s *WebServer) apiPreRegister(w http.ResponseWriter, r *http.Request) {
 
 // registration is used to register a new DEX account.
 type registration struct {
-	DEX      string `json:"dex"`
+	URL      string `json:"url"`
 	Password string `json:"pass"`
 	Fee      uint64 `json:"fee"`
 }
@@ -78,8 +74,8 @@ func (s *WebServer) apiRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err, payFeeErr := s.core.Register(&core.Registration{
-		DEX:      reg.DEX,
+	err := s.core.Register(&core.Registration{
+		URL:      reg.URL,
 		Password: reg.Password,
 		Fee:      reg.Fee,
 	})
@@ -87,20 +83,9 @@ func (s *WebServer) apiRegister(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, "registration error: %v", err)
 		return
 	}
-
 	// There was no error paying the fee, but we must wait on confirmations
 	// before informing the DEX of the fee payment. Those results will come
-	// through on the error channel returned by Register, so the caller should
-	// monitor the channel and send the result to the user as a notification.
-	go func() {
-		feeErr := <-payFeeErr
-		if feeErr != nil {
-			log.Errorf("Fee payment error: %v", feeErr)
-			s.notify(errorMsgRoute, fmt.Sprintf("Error encountered while notifying DEX of registration fee: %v", feeErr))
-		} else {
-			s.notify(successMsgRoute, fmt.Sprintf("Registration complete. You may now trade at %s.", reg.DEX))
-		}
-	}()
+	// through as a notification.
 	writeJSON(w, simpleAck(), s.indent)
 }
 
@@ -134,23 +119,6 @@ func (s *WebServer) apiNewWallet(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.writeAPIError(w, "error creating %s wallet: %v", unbip(form.AssetID), err)
-		return
-	}
-	s.notifyWalletUpdate(form.AssetID)
-	type response struct {
-		OK     bool   `json:"ok"`
-		Locked bool   `json:"locked"`
-		Msg    string `json:"msg"`
-	}
-	err = s.core.OpenWallet(form.AssetID, form.AppPW)
-	if err != nil {
-		errMsg := fmt.Sprintf("wallet connected, but failed to open with provided password: %v", err)
-		log.Errorf(errMsg)
-		resp := &response{
-			Locked: true,
-			Msg:    errMsg,
-		}
-		writeJSON(w, resp, s.indent)
 		return
 	}
 	s.notifyWalletUpdate(form.AssetID)
@@ -325,7 +293,7 @@ func (s *WebServer) apiWithdraw(w http.ResponseWriter, r *http.Request) {
 
 // apiActuallyLogin logs the user in.
 func (s *WebServer) actuallyLogin(w http.ResponseWriter, r *http.Request, login *loginForm) {
-	err := s.core.Login(login.Pass)
+	notes, err := s.core.Login(login.Pass)
 	if err != nil {
 		s.writeAPIError(w, "login error: %v", err)
 		return
@@ -339,7 +307,13 @@ func (s *WebServer) actuallyLogin(w http.ResponseWriter, r *http.Request, login 
 			Value: cval,
 		})
 	}
-	writeJSON(w, simpleAck(), s.indent)
+	writeJSON(w, struct {
+		OK    bool               `json:"ok"`
+		Notes []*db.Notification `json:"notes"`
+	}{
+		OK:    true,
+		Notes: notes,
+	}, s.indent)
 }
 
 // apiUser handles the 'user' API request.

@@ -25,11 +25,13 @@ import (
 	"decred.org/dcrdex/dex/encrypt"
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
+	"decred.org/dcrdex/dex/wait"
 	"github.com/decred/dcrd/dcrec/secp256k1/v2"
 )
 
 const (
-	keyParamsKey = "keyParams"
+	keyParamsKey     = "keyParams"
+	conversionFactor = 1e8
 )
 
 var (
@@ -38,6 +40,8 @@ var (
 	unbip          = dex.BipIDSymbol
 	aYear          = time.Hour * 24 * 365
 	requestTimeout = 10 * time.Second
+	// The coin waiters will query for transaction data every recheckInterval.
+	recheckInterval = time.Second * 5
 )
 
 // dexConnection is the websocket connection and the DEX configuration.
@@ -79,16 +83,16 @@ func (dc *dexConnection) refreshMarkets() map[string]*Market {
 			StartEpoch:      mkt.StartEpoch,
 			MarketBuyBuffer: mkt.MarketBuyBuffer,
 		}
-		mid := market.sid()
+		mid := market.mktID()
 		dc.tradeMtx.RLock()
 		for _, trade := range dc.trades {
-			if trade.sid == mid {
-				coreOrder, _ := trade.coreOrder()
-				market.Orders = append(market.Orders, coreOrder)
+			if trade.mktID == mid {
+				corder, _ := trade.coreOrder()
+				market.Orders = append(market.Orders, corder)
 			}
 		}
 		dc.tradeMtx.RUnlock()
-		marketMap[market.sid()] = market
+		marketMap[market.mktID()] = market
 	}
 	dc.marketMtx.Lock()
 	dc.marketMap = marketMap
@@ -156,7 +160,7 @@ func (dc *dexConnection) signAndRequest(signable msgjson.Signable, route string,
 	return nil
 }
 
-// ack sends and Acknowledgement for a match-related request.
+// ack sends an Acknowledgement for a match-related request.
 func (dc *dexConnection) ack(msgID uint64, matchID order.MatchID, signable msgjson.Signable) error {
 	ack := &msgjson.Acknowledgement{
 		MatchID: matchID[:],
@@ -257,6 +261,7 @@ func (dc *dexConnection) runMatches(matches map[order.OrderID]*trackerMatches) e
 			}
 		}
 	}
+	dc.refreshMarkets()
 	return nil
 }
 
@@ -314,6 +319,7 @@ type Core struct {
 	wsConstructor func(*comms.WsCfg) (comms.WsConn, error)
 	newCrypter    func(string) encrypt.Crypter
 	reCrypter     func(string, []byte) (encrypt.Crypter, error)
+	latencyQ      *wait.TickerQueue
 
 	connMtx sync.RWMutex
 	conns   map[string]*dexConnection
@@ -326,6 +332,9 @@ type Core struct {
 
 	userMtx sync.RWMutex
 	user    *User
+
+	noteMtx   sync.RWMutex
+	noteChans []chan Notification
 }
 
 // New is the constructor for a new Core.
@@ -348,6 +357,7 @@ func New(cfg *Config) (*Core, error) {
 		wsConstructor: comms.NewWsConn,
 		newCrypter:    encrypt.NewCrypter,
 		reCrypter:     encrypt.Deserialize,
+		latencyQ:      wait.NewTickerQueue(recheckInterval),
 	}
 
 	// Populate the initial user data. User won't include any DEX info yet, as
@@ -364,7 +374,16 @@ func (c *Core) Run(ctx context.Context) {
 	// when new accounts are registered.
 	c.ctx = ctx
 	c.initialize()
-	c.db.Run(ctx)
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.db.Run(ctx)
+	}()
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.latencyQ.Run(ctx)
+	}()
 	c.wg.Wait()
 	log.Infof("DEX client core off")
 }
@@ -491,6 +510,12 @@ func (c *Core) refreshUser() {
 
 // CreateWallet creates a new exchange wallet.
 func (c *Core) CreateWallet(appPW, walletPW string, form *WalletForm) error {
+	assetID := form.AssetID
+	_, exists := c.wallet(assetID)
+	if exists {
+		return fmt.Errorf("%s wallet already exists", unbip(assetID))
+	}
+
 	crypter, err := c.encryptionKey(appPW)
 	if err != nil {
 		return err
@@ -501,45 +526,41 @@ func (c *Core) CreateWallet(appPW, walletPW string, form *WalletForm) error {
 	}
 
 	dbWallet := &db.Wallet{
-		AssetID:     form.AssetID,
+		AssetID:     assetID,
 		Account:     form.Account,
 		INIPath:     form.INIPath,
 		EncryptedPW: encPW,
 	}
-	_, exists := c.wallet(form.AssetID)
-	if exists {
-		return fmt.Errorf("%s wallet already exists", unbip(dbWallet.AssetID))
-	}
 
 	wallet, err := c.loadWallet(dbWallet)
 	if err != nil {
-		return fmt.Errorf("error loading wallet for %d -> %s: %v", dbWallet.AssetID, unbip(dbWallet.AssetID), err)
+		return fmt.Errorf("error loading wallet for %d -> %s: %v", assetID, unbip(assetID), err)
 	}
 
 	err = wallet.Connect(c.ctx)
 	if err != nil {
-		// Assume that the wallet form values are invalid, and drop the wallet from
-		// the wallets map.
-		c.walletMtx.Lock()
-		delete(c.wallets, dbWallet.AssetID)
-		c.walletMtx.Unlock()
 		return fmt.Errorf("Error connecting wallet: %v", err)
 	}
 
 	initErr := func(s string, a ...interface{}) error {
-		wallet.connector.Disconnect()
+		wallet.Disconnect()
 		return fmt.Errorf(s, a...)
+	}
+
+	err = wallet.Unlock(walletPW, aYear)
+	if err != nil {
+		return initErr("%s wallet authentication error: %v", unbip(assetID), err)
 	}
 
 	dbWallet.Balance, _, err = wallet.Balance(0)
 	if err != nil {
-		return initErr("error getting balance for %s: %v", unbip(form.AssetID), err)
+		return initErr("error getting balance for %s: %v", unbip(assetID), err)
 	}
 	wallet.setBalance(dbWallet.Balance)
 
 	dbWallet.Address, err = wallet.Address()
 	if err != nil {
-		return initErr("error getting deposit address for %s: %v", unbip(form.AssetID), err)
+		return initErr("error getting deposit address for %s: %v", unbip(assetID), err)
 	}
 	wallet.setAddress(dbWallet.Address)
 
@@ -548,6 +569,11 @@ func (c *Core) CreateWallet(appPW, walletPW string, form *WalletForm) error {
 	if err != nil {
 		return initErr("error storing wallet credentials: %v", err)
 	}
+
+	// The wallet has been successfully created. Store it.
+	c.walletMtx.Lock()
+	c.wallets[assetID] = wallet
+	c.walletMtx.Unlock()
 
 	c.refreshUser()
 	return nil
@@ -577,10 +603,6 @@ func (c *Core) loadWallet(dbWallet *db.Wallet) (*xcWallet, error) {
 	}
 	wallet.Wallet = w
 	wallet.connector = dex.NewConnectionMaster(w)
-
-	c.walletMtx.Lock()
-	c.wallets[dbWallet.AssetID] = wallet
-	c.walletMtx.Unlock()
 	return wallet, nil
 }
 
@@ -645,7 +667,7 @@ func (c *Core) CloseWallet(assetID uint32) error {
 			return fmt.Errorf("cannot lock %s wallet with active orders or negotiations", unbip(assetID))
 		}
 	}
-	err = wallet.lock()
+	err = wallet.Lock()
 	if err != nil {
 		return err
 	}
@@ -662,15 +684,18 @@ func (c *Core) ConnectWallet(assetID uint32) error {
 // PreRegister creates a connection to the specified DEX and fetches the
 // registration fee. The connection is left open and stored temporarily while
 // registration is completed.
-func (c *Core) PreRegister(dex string) (uint64, error) {
+func (c *Core) PreRegister(form *PreRegisterForm) (uint64, error) {
 	c.connMtx.RLock()
-	_, found := c.conns[dex]
+	_, found := c.conns[form.URL]
 	c.connMtx.RUnlock()
 	if found {
-		return 0, fmt.Errorf("already registered at %s", dex)
+		return 0, fmt.Errorf("already registered at %s", form.URL)
 	}
 
-	dc, err := c.connectDEX(&db.AccountInfo{URL: dex})
+	dc, err := c.connectDEX(&db.AccountInfo{
+		URL:  form.URL,
+		Cert: []byte(form.Cert),
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -705,31 +730,32 @@ func (c *Core) PreRegister(dex string) (uint64, error) {
 // returned immediately as the first argument. A thread will be started to wait
 // for the requisite confirmations and send the fee notification to the server.
 // Any error returned from that thread will be sent over the returned channel.
-func (c *Core) Register(form *Registration) (error, <-chan error) {
+func (c *Core) Register(form *Registration) error {
 	// Check the app password.
 	crypter, err := c.encryptionKey(form.Password)
 	if err != nil {
-		return err, nil
+		return err
 	}
 	// For now, asset ID is hard-coded to Decred for registration fees.
 	assetID, _ := dex.BipSymbolID("dcr")
-	if form.DEX == "" {
-		return fmt.Errorf("no dex url specified"), nil
+	if form.URL == "" {
+		return fmt.Errorf("no dex url specified")
 	}
 	wallet, err := c.connectedWallet(assetID)
 	if err != nil {
-		return fmt.Errorf("Register: wallet error for %d -> %s: %v", assetID, unbip(assetID), err), nil
+		return fmt.Errorf("Register: wallet error for %d -> %s: %v", assetID, unbip(assetID), err)
 	}
 
 	// Make sure the account doesn't already exist.
-	_, err = c.db.Account(form.DEX)
+	_, err = c.db.Account(form.URL)
 	if err == nil {
-		return fmt.Errorf("account already exists for %s", form.DEX), nil
+		return fmt.Errorf("account already exists for %s", form.URL)
 	}
 
 	// Get a connection to the dex.
 	ai := &db.AccountInfo{
-		URL: form.DEX,
+		URL:  form.URL,
+		Cert: []byte(form.Cert),
 	}
 
 	// Lock conns map, pendingReg, and pendingTimer.
@@ -738,16 +764,17 @@ func (c *Core) Register(form *Registration) (error, <-chan error) {
 	// If it's not already in the map, see if there is a pre-registration pending.
 	if !found && c.pendingReg != nil {
 		if c.pendingReg.acct.url != ai.URL {
-			return fmt.Errorf("pending registration exists for dex %s", c.pendingReg.acct.url), nil
+			return fmt.Errorf("pending registration exists for dex %s", c.pendingReg.acct.url)
 		}
 		if c.pendingTimer != nil { // it should be set
 			if !c.pendingTimer.Stop() {
-				return fmt.Errorf("pre-registration timer already fired and shutdown the connection"), nil
+				return fmt.Errorf("pre-registration timer already fired and shutdown the connection")
 			}
 			c.pendingTimer = nil
 		}
 		dc = c.pendingReg
 		c.conns[ai.URL] = dc
+		ai.Cert = dc.acct.cert
 		found = true
 	}
 	// If it was neither in the map or pre-registered, get a new connection.
@@ -755,7 +782,7 @@ func (c *Core) Register(form *Registration) (error, <-chan error) {
 		dc, err = c.connectDEX(ai)
 		if err != nil {
 			c.connMtx.Unlock()
-			return err, nil
+			return err
 		}
 		c.conns[ai.URL] = dc
 	}
@@ -766,19 +793,19 @@ func (c *Core) Register(form *Registration) (error, <-chan error) {
 
 	regAsset, found := dc.assets[assetID]
 	if !found {
-		return fmt.Errorf("asset information not found: %v", err), nil
+		return fmt.Errorf("asset information not found: %v", err)
 	}
 
 	// Create a new private key for the account.
 	privKey, err := secp256k1.GeneratePrivateKey()
 	if err != nil {
-		return fmt.Errorf("error creating wallet key: %v", err), nil
+		return fmt.Errorf("error creating wallet key: %v", err)
 	}
 
 	// Encrypt the private key.
 	encKey, err := crypter.Encrypt(privKey.Serialize())
 	if err != nil {
-		return fmt.Errorf("error encrypting private key: %v", err), nil
+		return fmt.Errorf("error encrypting private key: %v", err)
 	}
 
 	// The account ID is generated from the public key.
@@ -791,13 +818,13 @@ func (c *Core) Register(form *Registration) (error, <-chan error) {
 	}
 	err = sign(privKey, dexReg)
 	if err != nil {
-		return err, nil
+		return err
 	}
 
 	// Create and send the the request, grabbing the result in the callback.
 	regMsg, err := msgjson.NewRequest(dc.NextID(), msgjson.RegisterRoute, dexReg)
 	if err != nil {
-		return fmt.Errorf("error encoding message: %v", err), nil
+		return fmt.Errorf("error encoding message: %v", err)
 	}
 	regRes := new(msgjson.RegisterResult)
 	errChan := make(chan error, 1)
@@ -805,34 +832,34 @@ func (c *Core) Register(form *Registration) (error, <-chan error) {
 		errChan <- msg.UnmarshalResult(regRes)
 	})
 	if err != nil {
-		return fmt.Errorf("'register' request error: %v", err), nil
+		return fmt.Errorf("'register' request error: %v", err)
 	}
 	err = extractError(errChan, requestTimeout, "register")
 	if err != nil {
-		return fmt.Errorf("'register' result decode error: %v", err), nil
+		return fmt.Errorf("'register' result decode error: %v", err)
 	}
 
 	// Check the server's signature.
 	msg, err := regRes.Serialize()
 	if err != nil {
-		return fmt.Errorf("error serializing RegisterResult for signature check: %v", err), nil
+		return fmt.Errorf("error serializing RegisterResult for signature check: %v", err)
 	}
 
 	// Create a public key for this account.
 	dexPubKey, err := checkSigS256(msg, regRes.DEXPubKey, regRes.Sig)
 	if err != nil {
-		return fmt.Errorf("DEX signature validation error: %v", err), nil
+		return fmt.Errorf("DEX signature validation error: %v", err)
 	}
 
 	// Check that the fee is non-zero.
 	if regRes.Fee == 0 {
-		return fmt.Errorf("zero registration fees not supported"), nil
+		return fmt.Errorf("zero registration fees not supported")
 	}
 	if regRes.Fee != dc.cfg.Fee {
-		return fmt.Errorf("DEX 'register' result fee doesn't match the 'config' value. %d != %d", regRes.Fee, dc.cfg.Fee), nil
+		return fmt.Errorf("DEX 'register' result fee doesn't match the 'config' value. %d != %d", regRes.Fee, dc.cfg.Fee)
 	}
 	if regRes.Fee != form.Fee {
-		return fmt.Errorf("registration fee provided to Register does not match the DEX registration fee. %d != %d", form.Fee, regRes.Fee), nil
+		return fmt.Errorf("registration fee provided to Register does not match the DEX registration fee. %d != %d", form.Fee, regRes.Fee)
 	}
 
 	// Pay the registration fee.
@@ -840,7 +867,7 @@ func (c *Core) Register(form *Registration) (error, <-chan error) {
 		regRes.Fee, regAsset.Symbol)
 	coin, err := wallet.PayFee(regRes.Address, regRes.Fee, regAsset)
 	if err != nil {
-		return fmt.Errorf("error paying registration fee: %v", err), nil
+		return fmt.Errorf("error paying registration fee: %v", err)
 	}
 	// Set the dexConnection account fields.
 	dc.acct.dexPubKey = dexPubKey
@@ -857,29 +884,35 @@ func (c *Core) Register(form *Registration) (error, <-chan error) {
 		log.Errorf("error saving account: %v", err)
 		// Don't abandon registration. The fee is already paid.
 	}
+	details := fmt.Sprintf("Waiting for %d confirmations before trading at %s", dc.cfg.RegFeeConfirms, dc.acct.url)
+	c.notify(newFeePaymentNote("Fee paid", details, db.Success))
 
 	trigger := confTrigger(wallet, coin.ID(), dc.cfg.RegFeeConfirms)
 	// Set up the coin waiter.
-	errChan = make(chan error, 1)
 	c.wait(assetID, trigger, func(err error) {
 		log.Debugf("Registration fee txn %x now has %d confirmations.", coin.ID(), dc.cfg.RegFeeConfirms)
+		defer func() {
+			if err != nil {
+				details := fmt.Sprintf("Error encountered while paying fees to %s: %v", dc.acct.url, err)
+				c.notify(newFeePaymentNote("Fee payment error", details, db.ErrorLevel))
+			} else {
+				details := fmt.Sprintf("You may now trade at %s", dc.acct.url)
+				c.notify(newFeePaymentNote("Account registered", details, db.Success))
+			}
+		}()
 		if err != nil {
-			errChan <- err
+			return
 		}
 		log.Infof("Notifying dex %s of fee payment.", dc.acct.url)
 		err = c.notifyFee(dc, coin.ID())
 		if err != nil {
-			errChan <- err
 			return
 		}
 		dc.acct.pay()
-		// New account won't have any active negotiations, so OK to discard first
-		// first return value from authDEX.
 		err = c.authDEX(dc)
-		errChan <- err
 	})
 	c.refreshUser()
-	return nil, errChan
+	return nil
 }
 
 // InitializeClient sets the initial app-wide password for the client.
@@ -897,14 +930,14 @@ func (c *Core) InitializeClient(pw string) error {
 }
 
 // Login logs the user in, decrypting the account keys for all known DEXes.
-func (c *Core) Login(pw string) (err error) {
+func (c *Core) Login(pw string) ([]*db.Notification, error) {
+	errs := newErrorSet("Login: ")
 	crypter, err := c.encryptionKey(pw)
 	if err != nil {
-		return err
+		return nil, errs.addErr(err)
 	}
 	var wg sync.WaitGroup
 	var mtx sync.Mutex
-	var errs []string
 	c.connMtx.RLock()
 	defer c.connMtx.RUnlock()
 	for _, dc := range c.conns {
@@ -914,13 +947,13 @@ func (c *Core) Login(pw string) (err error) {
 		}
 		err := dc.acct.unlock(crypter)
 		if err != nil {
-			log.Errorf("error unlocking account for %s: %v", dc.acct.url, err)
+			errs.add("error unlocking account for %s: %v", dc.acct.url, err)
 			continue
 		}
 		if !dc.acct.paid() {
 			// Unlock the account, but don't authenticate. Registration will be
 			// completed when the user unlocks the Decred password.
-			log.Infof("skipping authorization for unpaid account %s", dc.acct.url)
+			log.Errorf("skipping authorization for unpaid account %s", dc.acct.url)
 			continue
 		}
 		wg.Add(1)
@@ -929,18 +962,22 @@ func (c *Core) Login(pw string) (err error) {
 			err := c.authDEX(dc)
 			if err != nil {
 				mtx.Lock()
-				errs = append(errs, fmt.Sprintf("%s: %v", dc.acct.url, err))
+				errs.add("authDEX error for %s: %v", dc.acct.url, err)
 				mtx.Unlock()
 				return
 			}
 		}(dc)
 	}
+
 	wg.Wait()
-	if len(errs) > 0 {
-		err = fmt.Errorf("authorization errors: %s", strings.Join(errs, ", "))
+
+	notes, err := c.db.NotificationsN(10)
+	if err != nil {
+		errs.addErr(err)
 	}
+
 	c.refreshUser()
-	return err
+	return notes, errs.ifany()
 }
 
 var waiterID uint64
@@ -1026,7 +1063,15 @@ func (c *Core) Withdraw(pw string, assetID uint32, value uint64) (asset.Coin, er
 	if !found {
 		return nil, fmt.Errorf("%s wallet not found", unbip(assetID))
 	}
-	return wallet.Withdraw(wallet.address, value, wallet.Info().FeeRate)
+	coin, err := wallet.Withdraw(wallet.address, value, wallet.Info().FeeRate)
+	if err != nil {
+		details := fmt.Sprintf("Error encountered during %s withdraw: %v", unbip(assetID), err)
+		c.notify(newWithdrawNote("Withdraw error", details, db.ErrorLevel))
+	} else {
+		details := fmt.Sprintf("Withdraw of %s has completed successfully. %s", unbip(assetID), coin)
+		c.notify(newWithdrawNote("Withdraw sent", details, db.Success))
+	}
+	return coin, err
 }
 
 // Trade is used to place a market or limit order.
@@ -1185,17 +1230,26 @@ func (c *Core) Trade(pw string, form *TradeForm) (*Order, error) {
 	}
 
 	// Prepare and store the tracker and get the core.Order to return.
-	tracker := newTrackedTrade(dbOrder, preImg, dc, c.db, wallets, coins)
-	coreOrder, _ := tracker.coreOrder()
+	tracker := newTrackedTrade(dbOrder, preImg, dc, c.db, c.latencyQ, wallets, coins, c.notify)
+	corder, _ := tracker.coreOrder()
 	dc.tradeMtx.Lock()
 	dc.trades[tracker.ID()] = tracker
 	dc.tradeMtx.Unlock()
+
+	// Send a low-priority notification.
+	details := fmt.Sprintf("%sing %.8f %s (%s)",
+		sellString(corder.Sell), float64(corder.Qty)/conversionFactor, unbip(form.Base), tracker.token())
+	if !form.IsLimit && !form.Sell {
+		details = fmt.Sprintf("selling %.8f %s (%s)",
+			float64(corder.Qty)/conversionFactor, unbip(form.Quote), tracker.token())
+	}
+	c.notify(newOrderNote("Order placed", details, db.Poke, corder))
 
 	// Refresh the markets and user.
 	dc.refreshMarkets()
 	c.refreshUser()
 
-	return coreOrder, nil
+	return corder, nil
 }
 
 // walletSet is a pair of wallets with asset configurations identified in useful
@@ -1436,6 +1490,8 @@ func (c *Core) initialize() {
 				log.Infof("Incomplete registration detected for DEX %s. "+
 					"Registration will be completed when the Decred wallet is unlocked.",
 					acct.URL)
+				details := fmt.Sprintf("Unlock your Decred wallet to complete registration for %s", acct.URL)
+				c.notify(newFeePaymentNote("Incomplete registration", details, db.WarningLevel))
 				// checkUnpaidFees will pay the fees if the wallet is unlocked
 			}
 			c.connMtx.Lock()
@@ -1459,17 +1515,19 @@ func (c *Core) initialize() {
 	if err != nil {
 		log.Errorf("error loading wallets from database: %v", err)
 	}
+	c.walletMtx.Lock()
 	for _, dbWallet := range dbWallets {
-		_, err := c.loadWallet(dbWallet)
+		wallet, err := c.loadWallet(dbWallet)
 		if err != nil {
 			aid := dbWallet.AssetID
 			log.Errorf("error loading %d -> %s wallet: %v", aid, unbip(aid), err)
+			continue
 		}
+		c.wallets[dbWallet.AssetID] = wallet
 	}
+	numWallets := len(c.wallets)
+	c.walletMtx.Unlock()
 	if len(dbWallets) > 0 {
-		c.walletMtx.RLock()
-		numWallets := len(c.wallets)
-		c.walletMtx.RUnlock()
 		log.Infof("successfully loaded %d of %d wallets", numWallets, len(dbWallets))
 	}
 	c.refreshUser()
@@ -1535,8 +1593,12 @@ func (c *Core) reFee(dcrWallet *xcWallet, dc *dexConnection) {
 		err := c.notifyFee(dc, acctInfo.FeeCoin)
 		if err != nil {
 			log.Errorf("reFee %s - notifyfee error: %v", dc.acct.url, err)
+			details := fmt.Sprintf("Error encountered while paying fees to %s: %v", dc.acct.url, err)
+			c.notify(newFeePaymentNote("Fee payment error", details, db.ErrorLevel))
 		} else {
 			log.Infof("Fee paid at %s", dc.acct.url)
+			details := fmt.Sprintf("You may now trade at %s.", dc.acct.url)
+			c.notify(newFeePaymentNote("Registration complete", details, db.Success))
 			// dc.acct.pay() and c.authDEX????
 			dc.acct.pay()
 			err = c.authDEX(dc)
@@ -1562,8 +1624,6 @@ func (c *Core) reFee(dcrWallet *xcWallet, dc *dexConnection) {
 		}
 		dc.acct.pay()
 		log.Infof("waiter: Fee paid at %s", dc.acct.url)
-		// New account won't have any active negotiations, so OK to discard first
-		// first return value from authDEX.
 		err = c.authDEX(dc)
 		if err != nil {
 			log.Errorf("fee paid, but failed to authenticate connection to %s", dc.acct.url)
@@ -1612,7 +1672,7 @@ func (c *Core) dbTrackers(dc *dexConnection) (map[order.OrderID]*trackedTrade, e
 			}
 			var preImg order.Preimage
 			copy(preImg[:], dbOrder.MetaData.Proof.Preimage)
-			trackers[dbOrder.Order.ID()] = newTrackedTrade(dbOrder, preImg, dc, c.db, wallets, coins)
+			trackers[dbOrder.Order.ID()] = newTrackedTrade(dbOrder, preImg, dc, c.db, c.latencyQ, wallets, coins, c.notify)
 		}
 	}
 	for oid := range cancels {
@@ -1640,7 +1700,7 @@ func (c *Core) connectDEX(acctInfo *db.AccountInfo) (*dexConnection, error) {
 	conn, err := c.wsConstructor(&comms.WsCfg{
 		URL:      "wss://" + parsedURL.Host + "/ws",
 		PingWait: 60 * time.Second,
-		RpcCert:  c.certs[uri],
+		Cert:     acctInfo.Cert,
 		ReconnectSync: func() {
 			go c.handleReconnect(uri)
 		},
@@ -1863,6 +1923,32 @@ func handleMatchProofMsg(_ *Core, dc *dexConnection, msg *msgjson.Message) error
 	return ob.ValidateMatchProof(note)
 }
 
+// handleRevokeMatchMsg is called when a revoke_match message is received.
+func handleRevokeMatchMsg(_ *Core, dc *dexConnection, msg *msgjson.Message) error {
+	var revocation msgjson.RevokeMatch
+	err := msg.Unmarshal(&revocation)
+	if err != nil {
+		return fmt.Errorf("revoke match unmarshal error: %v", err)
+	}
+
+	var oid order.OrderID
+	copy(oid[:], revocation.OrderID)
+
+	tracker, _, _ := dc.findOrder(oid)
+	if tracker == nil {
+		return fmt.Errorf("no order found with id %s", oid.String())
+	}
+
+	md := tracker.metaData
+	md.Status = order.OrderStatusRevoked
+	metaOrder := &db.MetaOrder{
+		MetaData: md,
+		Order:    tracker.Order,
+	}
+
+	return tracker.db.UpdateOrder(metaOrder)
+}
+
 // routeHandler is a handler for a message from the DEX.
 type routeHandler func(*Core, *dexConnection, *msgjson.Message) error
 
@@ -1872,7 +1958,7 @@ var reqHandlers = map[string]routeHandler{
 	msgjson.MatchRoute:       handleMatchRoute,
 	msgjson.AuditRoute:       handleAuditRoute,
 	msgjson.RedemptionRoute:  handleRedemptionRoute,
-	msgjson.RevokeMatchRoute: nil,
+	msgjson.RevokeMatchRoute: handleRevokeMatchMsg,
 	msgjson.SuspensionRoute:  nil,
 }
 
@@ -1950,7 +2036,7 @@ out:
 
 // handlePreimageRequest handles a DEX-originating request for an order
 // preimage.
-func handlePreimageRequest(_ *Core, dc *dexConnection, msg *msgjson.Message) error {
+func handlePreimageRequest(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 	req := new(msgjson.PreimageRequest)
 	err := msg.Unmarshal(req)
 	if err != nil {
@@ -1959,7 +2045,7 @@ func handlePreimageRequest(_ *Core, dc *dexConnection, msg *msgjson.Message) err
 
 	var oid order.OrderID
 	copy(oid[:], req.OrderID)
-	tracker, preImg, _ := dc.findOrder(oid)
+	tracker, preImg, isCancel := dc.findOrder(oid)
 	if tracker == nil {
 		return fmt.Errorf("no active order found for preimage request for %s", oid)
 	}
@@ -1973,6 +2059,15 @@ func handlePreimageRequest(_ *Core, dc *dexConnection, msg *msgjson.Message) err
 	if err != nil {
 		return fmt.Errorf("preimage send error: %v", err)
 	}
+	corder, cancelOrder := tracker.coreOrder()
+	var details string
+	if isCancel {
+		corder = cancelOrder
+		details = fmt.Sprintf("match cycle has begun for cancellation order for trade %s", tracker.token())
+	} else {
+		details = fmt.Sprintf("match cycle has begun for order %s", tracker.token())
+	}
+	c.notify(newOrderNote("Preimage sent", details, db.Poke, corder))
 	return nil
 }
 
@@ -1997,6 +2092,8 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 	if err != nil {
 		return err
 	}
+
+	defer c.refreshUser()
 
 	return dc.runMatches(matches)
 }

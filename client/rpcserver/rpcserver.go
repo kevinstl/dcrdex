@@ -49,9 +49,16 @@ var (
 type ClientCore interface {
 	Balance(assetID uint32) (baseUnits uint64, err error)
 	Book(dex string, base, quote uint32) (orderBook *core.OrderBook)
-	PreRegister(dexURL string) (fee uint64, err error)
+	PreRegister(*core.PreRegisterForm) (fee uint64, err error)
 	Sync(dex string, base, quote uint32) (updateChan chan *core.BookUpdate, err error)
+	CloseWallet(assetID uint32) error
+	CreateWallet(appPass, walletPass string, form *core.WalletForm) error
+	InitializeClient(appPass string) error
+	OpenWallet(assetID uint32, pw string) error
 	Unsync(dex string, base, quote uint32)
+	WalletState(assetID uint32) (walletState *core.WalletState)
+	Wallets() (walletsStates []*core.WalletState)
+	Register(registrationForm *core.Registration) error
 }
 
 // marketSyncer is used to synchronize market subscriptions. The marketSyncer

@@ -13,8 +13,8 @@ import (
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
+	"decred.org/dcrdex/dex/wait"
 	"decred.org/dcrdex/server/account"
-	"decred.org/dcrdex/server/coinwaiter"
 	"decred.org/dcrdex/server/comms"
 	"github.com/decred/dcrd/dcrec/secp256k1/v2"
 )
@@ -130,6 +130,7 @@ func (client *clientInfo) respHandler(id uint64) *respHandler {
 // signing messages with the DEX's private key. AuthManager manages requests to
 // the 'connect' route.
 type AuthManager struct {
+	anarchy      bool
 	connMtx      sync.RWMutex
 	cancelThresh float64
 	users        map[account.AccountID]*clientInfo
@@ -139,8 +140,8 @@ type AuthManager struct {
 	regFee       uint64
 	checkFee     FeeChecker
 	feeConfs     int64
-	// coinWaiter is a coin waiter to deal with latency.
-	coinWaiter *coinwaiter.Waiter
+	// latencyQ is a queue for coin waiters to deal with latency.
+	latencyQ *wait.TickerQueue
 }
 
 // Config is the configuration settings for the AuthManager, and the only
@@ -160,11 +161,13 @@ type Config struct {
 	FeeChecker FeeChecker
 
 	CancelThreshold float64
+	Anarchy         bool
 }
 
 // NewAuthManager is the constructor for an AuthManager.
 func NewAuthManager(cfg *Config) *AuthManager {
 	auth := &AuthManager{
+		anarchy:      cfg.Anarchy,
 		users:        make(map[account.AccountID]*clientInfo),
 		conns:        make(map[uint64]*clientInfo),
 		storage:      cfg.Storage,
@@ -176,7 +179,7 @@ func NewAuthManager(cfg *Config) *AuthManager {
 	}
 	// Referring to auth.Send in the construction above would create a function
 	// with a nil receiver, so do it after auth is set.
-	auth.coinWaiter = coinwaiter.New(recheckInterval, auth.Send)
+	auth.latencyQ = wait.NewTickerQueue(recheckInterval)
 
 	comms.Route(msgjson.ConnectRoute, auth.handleConnect)
 	comms.Route(msgjson.RegisterRoute, auth.handleRegister)
@@ -231,7 +234,7 @@ func (auth *AuthManager) recordOrderDone(user account.AccountID, oid order.Order
 // Run runs the AuthManager until the context is canceled. Satisfies the
 // dex.Runner interface.
 func (auth *AuthManager) Run(ctx context.Context) {
-	go auth.coinWaiter.Run(ctx)
+	go auth.latencyQ.Run(ctx)
 	<-ctx.Done()
 }
 
@@ -284,9 +287,11 @@ func (auth *AuthManager) Send(user account.AccountID, msg *msgjson.Message) {
 		log.Errorf("Send requested for unknown user %x", user[:])
 		return
 	}
+
 	err := client.conn.Send(msg)
 	if err != nil {
 		log.Debugf("error sending on link: %v", err)
+		auth.removeClient(client)
 	}
 }
 
@@ -314,6 +319,7 @@ func (auth *AuthManager) RequestWithTimeout(user account.AccountID, msg *msgjson
 	err := client.conn.Request(msg, auth.handleResponse, expireTime, func() {})
 	if err != nil {
 		log.Debugf("error sending request: %v", err)
+		auth.removeClient(client)
 	}
 	return err
 }
@@ -326,9 +332,15 @@ func (auth *AuthManager) Penalize(user account.AccountID, rule account.Rule) { /
 		log.Errorf("no client to penalize")
 		return
 	}
+	if auth.anarchy {
+		log.Infof("user %v penalized for rule %v, but not enforcing it", user, rule)
+		return
+	}
 	auth.storage.CloseAccount(client.acct.ID, rule)
-	client.conn.Banish() // May not want to do this. Leaving it for now.
-	auth.removeClient(client)
+
+	// We do NOT want to do disconnect if the user has active swaps. TODO:
+	// However, we do not want the user to initiate a swap or place a new order,
+	// so there should be appropriate checks on order submission.
 }
 
 // user gets the clientInfo for the specified account ID.
@@ -547,6 +559,7 @@ func (auth *AuthManager) handleResponse(conn comms.Link, msg *msgjson.Message) {
 			err := conn.Send(errMsg)
 			if err != nil {
 				log.Tracef("error sending response failure message: %v", err)
+				auth.removeClient(client)
 			}
 		}
 		return

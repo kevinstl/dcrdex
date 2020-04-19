@@ -22,6 +22,7 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v2"
 	"github.com/decred/dcrd/dcrutil/v2"
 	chainjson "github.com/decred/dcrd/rpc/jsonrpc/types/v2"
+	"github.com/decred/dcrd/rpcclient/v5"
 	"github.com/decred/dcrd/txscript/v2"
 	"github.com/decred/dcrd/wire"
 	walletjson "github.com/decred/dcrwallet/rpc/jsonrpc/types"
@@ -223,7 +224,7 @@ func (c *tRPCClient) GetRawChangeAddress(account string, net dcrutil.AddressPara
 	return c.changeAddr, c.changeAddrErr
 }
 
-func (c *tRPCClient) GetNewAddress(account string, net dcrutil.AddressParams) (dcrutil.Address, error) {
+func (c *tRPCClient) GetNewAddressGapPolicy(account string, gapPolicy rpcclient.GapPolicy, net dcrutil.AddressParams) (dcrutil.Address, error) {
 	return c.newAddr, c.newAddrErr
 }
 
@@ -336,6 +337,14 @@ func TestAvailableFund(t *testing.T) {
 	if err == nil {
 		t.Fatalf("no funding error for zero value")
 	}
+
+	// Nothing to spend
+	node.unspent = nil
+	_, err = wallet.Fund(littleBit-5000, tDCR)
+	if err == nil {
+		t.Fatalf("no error for zero utxos")
+	}
+	node.unspent = unspents
 
 	// RPC error
 	node.unspentErr = tErr
@@ -1068,6 +1077,7 @@ func TestRefund(t *testing.T) {
 	bigOutID := outpointID(tTxHash, 0)
 	node.txOutRes[bigOutID] = bigTxOut
 	node.changeAddr = tPKHAddr
+	node.newAddr = tPKHAddr
 
 	privBytes, _ := hex.DecodeString("b07209eec1a8fb6cfe5cb6ace36567406971a75c330db7101fb21bc679bc5330")
 	privKey, _ := secp256k1.PrivKeyFromBytes(privBytes)
@@ -1116,14 +1126,6 @@ func TestRefund(t *testing.T) {
 	}
 	node.txOutRes[bigOutID] = bigTxOut
 
-	// getrawchangeaddress error
-	node.changeAddrErr = tErr
-	err = wallet.Refund(receipt, tDCR)
-	if err == nil {
-		t.Fatalf("no error for getrawchangeaddress rpc error")
-	}
-	node.changeAddrErr = nil
-
 	// signature error
 	node.privWIFErr = tErr
 	err = wallet.Refund(receipt, tDCR)
@@ -1166,10 +1168,14 @@ const (
 
 func testSender(t *testing.T, senderType tSenderType) {
 	wallet, node, shutdown := tNewWallet()
+	var sendVal uint64 = 1e8
+	var unspentVal uint64 = 100e8
 	sender := func(addr string, val uint64) (asset.Coin, error) {
 		return wallet.PayFee(addr, val, tDCR)
 	}
 	if senderType == tWithdrawSender {
+		// For withdraw, test with unspent total = withdraw value
+		unspentVal = sendVal
 		sender = func(addr string, val uint64) (asset.Coin, error) {
 			return wallet.Withdraw(addr, val, walletInfo.FeeRate)
 		}
@@ -1181,32 +1187,32 @@ func testSender(t *testing.T, senderType tSenderType) {
 	node.unspent = []walletjson.ListUnspentResult{{
 		TxID:          tTxID,
 		Address:       tPKHAddr.String(),
-		Amount:        100e8,
+		Amount:        float64(unspentVal) / 1e8,
 		Confirmations: 5,
 		ScriptPubKey:  hex.EncodeToString(tP2PKHScript),
 	}}
 
-	_, err := sender(addr, 1e8)
+	_, err := sender(addr, sendVal)
 	if err != nil {
 		t.Fatalf("PayFee error: %v", err)
 	}
 
 	// invalid address
-	_, err = sender("badaddr", 1e8)
+	_, err = sender("badaddr", sendVal)
 	if err == nil {
 		t.Fatalf("no error for bad address: %v", err)
 	}
 
 	// GetRawChangeAddress error
 	node.changeAddrErr = tErr
-	_, err = sender(addr, 1e8)
+	_, err = sender(addr, sendVal)
 	if err == nil {
 		t.Fatalf("no error for rawchangeaddress: %v", err)
 	}
 	node.changeAddrErr = nil
 
 	// good again
-	_, err = sender(addr, 1e8)
+	_, err = sender(addr, sendVal)
 	if err != nil {
 		t.Fatalf("PayFee error afterwards: %v", err)
 	}

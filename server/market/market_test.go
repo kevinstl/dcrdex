@@ -45,10 +45,10 @@ func (a *TAsset) FundingCoin(coinID []byte, redeemScript []byte) (asset.FundingC
 func (a *TAsset) Redemption(redemptionID, contractID []byte) (asset.Coin, error) {
 	return nil, nil
 }
-func (a *TAsset) BlockChannel(size int) chan uint32 { return nil }
-func (a *TAsset) InitTxSize() uint32                { return 100 }
-func (a *TAsset) CheckAddress(string) bool          { return true }
-func (a *TAsset) Run(context.Context)               {}
+func (a *TAsset) BlockChannel(size int) <-chan *asset.BlockUpdate { return nil }
+func (a *TAsset) InitTxSize() uint32                              { return 100 }
+func (a *TAsset) CheckAddress(string) bool                        { return true }
+func (a *TAsset) Run(context.Context)                             {}
 func (a *TAsset) ValidateCoinID(coinID []byte) (string, error) {
 	return "", nil
 }
@@ -160,7 +160,7 @@ func (ta *TArchivist) SaveContractB(mid db.MarketMatchID, contract []byte, coinI
 func (ta *TArchivist) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error { return nil }
 
 // Redeem data.
-func (ta *TArchivist) SaveRedeemA(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
+func (ta *TArchivist) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
 	return nil
 }
 func (ta *TArchivist) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {

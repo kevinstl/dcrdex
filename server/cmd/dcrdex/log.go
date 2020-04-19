@@ -8,10 +8,11 @@ import (
 	"os"
 	"path/filepath"
 
+	"decred.org/dcrdex/dex/wait"
 	"decred.org/dcrdex/dex/ws"
+	"decred.org/dcrdex/server/admin"
 	"decred.org/dcrdex/server/auth"
 	"decred.org/dcrdex/server/book"
-	"decred.org/dcrdex/server/coinwaiter"
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	dexsrv "decred.org/dcrdex/server/dex"
@@ -28,6 +29,9 @@ type logWriter struct{}
 
 // Write writes the data in p to standard out and the log rotator.
 func (logWriter) Write(p []byte) (n int, err error) {
+	if logRotator == nil {
+		return os.Stdout.Write(p)
+	}
 	os.Stdout.Write(p)
 	return logRotator.Write(p)
 }
@@ -60,6 +64,7 @@ var (
 	bookLogger    = backendLog.Logger("BOOK")
 	matcherLogger = backendLog.Logger("MTCH")
 	waiterLogger  = backendLog.Logger("CHWT")
+	adminLogger   = backendLog.Logger("ADMN")
 )
 
 func init() {
@@ -72,7 +77,8 @@ func init() {
 	swap.UseLogger(swapLogger)
 	book.UseLogger(bookLogger)
 	matcher.UseLogger(matcherLogger)
-	coinwaiter.UseLogger(waiterLogger)
+	wait.UseLogger(waiterLogger)
+	admin.UseLogger(adminLogger)
 }
 
 // subsystemLoggers maps each subsystem identifier to its associated logger.
@@ -90,6 +96,7 @@ var subsystemLoggers = map[string]slog.Logger{
 	"ASSET": slog.Disabled,
 	"BOOK":  bookLogger,
 	"MTCH":  matcherLogger,
+	"ADMN":  adminLogger,
 }
 
 // initLogRotator initializes the logging rotater to write logs to logFile and

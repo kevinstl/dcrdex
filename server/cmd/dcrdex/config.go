@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/user"
@@ -17,7 +16,6 @@ import (
 	"time"
 
 	"decred.org/dcrdex/dex"
-	"github.com/decred/dcrd/dcrec/secp256k1/v2"
 	"github.com/decred/dcrd/dcrutil/v2"
 	flags "github.com/jessevdk/go-flags"
 )
@@ -35,9 +33,10 @@ const (
 	defaultPGHost              = "127.0.0.1:5432"
 	defaultPGUser              = "dcrdex"
 	defaultPGDBName            = "dcrdex"
-	defaultDEXPrivKeyFilename  = "dexprivkey"
+	defaultDEXPrivKeyFilename  = "sigkey"
 	defaultRPCHost             = "127.0.0.1"
 	defaultRPCPort             = "7232"
+	defaultAdminSrvAddr        = "127.0.0.1:6542"
 
 	defaultCancelThresh     = 0.6
 	defaultRegFeeConfirms   = 4
@@ -62,18 +61,22 @@ type dexConf struct {
 	DBPass           string
 	DBHost           string
 	DBPort           uint16
+	ShowPGConfig     bool
 	MarketsConfPath  string
 	RegFeeXPub       string
 	RegFeeConfirms   int64
 	RegFeeAmount     uint64
 	CancelThreshold  float64
-	DEXPrivKey       *secp256k1.PrivateKey
+	Anarchy          bool
+	DEXPrivKeyPath   string
 	RPCCert          string
 	RPCKey           string
 	RPCListen        []string
 	BroadcastTimeout time.Duration
 	AltDNSNames      []string
 	LogMaker         *dex.LoggerMaker
+	AdminSrvOn       bool
+	AdminSrvAddr     string
 }
 
 type flagsData struct {
@@ -100,6 +103,7 @@ type flagsData struct {
 	RegFeeConfirms   int64         `long:"regfeeconfirms" description:"The number of confirmations required to consider a registration fee paid."`
 	RegFeeAmount     uint64        `long:"regfeeamount" description:"The registration fee amount in atoms."`
 	CancelThreshold  float64       `long:"cancelthresh" description:"Cancellation ratio threshold (cancels/completed)."`
+	Anarchy          bool          `long:"anarchy" description:"Do not enforce any rules."`
 	DEXPrivKeyPath   string        `long:"dexprivkeypath" description:"The path to a file containing the DEX private key for message signing."`
 
 	HTTPProfile bool   `long:"httpprof" short:"p" description:"Start HTTP profiler."`
@@ -109,7 +113,9 @@ type flagsData struct {
 	PGUser       string `long:"pguser" description:"PostgreSQL DB user."`
 	PGPass       string `long:"pgpass" description:"PostgreSQL DB password."`
 	PGHost       string `long:"pghost" description:"PostgreSQL server host:port or UNIX socket (e.g. /run/postgresql)."`
-	HidePGConfig bool   `long:"hidepgconfig" description:"Blocks logging of the PostgreSQL db configuration on system start up."`
+	ShowPGConfig bool   `long:"showpgconfig" description:"Logs the PostgreSQL db configuration on system start up."`
+	AdminSrvOn   bool   `long:"adminsrvon" description:"turn on the admin server"`
+	AdminSrvAddr string `long:"adminsrvaddr" description:"administration HTTPS server address (default: 127.0.0.1:6542)"`
 }
 
 // cleanAndExpandPath expands environment variables and leading ~ in the passed
@@ -489,13 +495,18 @@ func loadConfig() (*dexConf, *procOpts, error) {
 		dbPort = uint16(port)
 	}
 
-	// Load the DEX signing key. TODO: Implement a secure key storage scheme.
-	pkFileBuffer, err := ioutil.ReadFile(cfg.DEXPrivKeyPath)
-	if err != nil {
-		return loadConfigError(fmt.Errorf("unable to read DEX private key file %s: %v",
-			cfg.DEXPrivKeyPath, err))
+	adminSrvAddr := defaultAdminSrvAddr
+	if cfg.AdminSrvAddr != "" {
+		_, port, err := net.SplitHostPort(cfg.AdminSrvAddr)
+		if err != nil {
+			return loadConfigError(fmt.Errorf("invalid admin server host %q: %v", cfg.AdminSrvAddr, err))
+		}
+		_, err = strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return loadConfigError(fmt.Errorf("invalid admin server port %q: %v", port, err))
+		}
+		adminSrvAddr = cfg.AdminSrvAddr
 	}
-	privKey, _ := secp256k1.PrivKeyFromBytes(pkFileBuffer)
 
 	dexCfg := &dexConf{
 		Network:          network,
@@ -504,18 +515,22 @@ func loadConfig() (*dexConf, *procOpts, error) {
 		DBPort:           dbPort,
 		DBUser:           cfg.PGUser,
 		DBPass:           cfg.PGPass,
+		ShowPGConfig:     cfg.ShowPGConfig,
 		MarketsConfPath:  cfg.MarketsConfPath,
 		RegFeeAmount:     cfg.RegFeeAmount,
 		RegFeeConfirms:   cfg.RegFeeConfirms,
 		RegFeeXPub:       cfg.RegFeeXPub,
 		CancelThreshold:  cfg.CancelThreshold,
-		DEXPrivKey:       privKey,
+		Anarchy:          cfg.Anarchy,
+		DEXPrivKeyPath:   cfg.DEXPrivKeyPath,
 		RPCCert:          cfg.RPCCert,
 		RPCKey:           cfg.RPCKey,
 		RPCListen:        RPCListen,
 		BroadcastTimeout: cfg.BroadcastTimeout,
 		AltDNSNames:      cfg.AltDNSNames,
 		LogMaker:         logMaker,
+		AdminSrvAddr:     adminSrvAddr,
+		AdminSrvOn:       cfg.AdminSrvOn,
 	}
 
 	opts := &procOpts{

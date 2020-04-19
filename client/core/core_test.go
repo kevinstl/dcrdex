@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/client/comms"
 	"decred.org/dcrdex/client/db"
+	dbtest "decred.org/dcrdex/client/db/test"
 	book "decred.org/dcrdex/client/order"
 	"decred.org/dcrdex/dex"
 	dexbtc "decred.org/dcrdex/dex/btc"
@@ -25,7 +27,9 @@ import (
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
 	ordertest "decred.org/dcrdex/dex/order/test"
+	"decred.org/dcrdex/dex/wait"
 	"decred.org/dcrdex/server/account"
+	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/secp256k1/v2"
 	"github.com/decred/slog"
 )
@@ -287,6 +291,9 @@ func (db *TDB) AccountPaid(proof *db.AccountProof) error {
 	return nil
 }
 
+func (db *TDB) SaveNotification(*db.Notification) error        { return nil }
+func (db *TDB) NotificationsN(int) ([]*db.Notification, error) { return nil, nil }
+
 func (db *TDB) Store(k string, b []byte) error {
 	return db.storeErr
 }
@@ -301,6 +308,8 @@ func (db *TDB) Get(k string) ([]byte, error) {
 func (db *TDB) Backup() error {
 	return nil
 }
+
+func (db *TDB) AckNotification(id []byte) error { return nil }
 
 type tCoin struct {
 	id       []byte
@@ -379,6 +388,9 @@ type TXCWallet struct {
 	redeemCoins  []dex.Bytes
 	badSecret    bool
 	fundedVal    uint64
+	connectErr   error
+	unlockErr    error
+	balErr       error
 }
 
 func newTWallet(assetID uint32) (*xcWallet, *TXCWallet) {
@@ -397,13 +409,13 @@ func (w *TXCWallet) Info() *asset.WalletInfo {
 }
 
 func (w *TXCWallet) Connect(ctx context.Context) (error, *sync.WaitGroup) {
-	return nil, &sync.WaitGroup{}
+	return w.connectErr, &sync.WaitGroup{}
 }
 
 func (w *TXCWallet) Run(ctx context.Context) { <-ctx.Done() }
 
 func (w *TXCWallet) Balance(confs uint32) (available, locked uint64, err error) {
-	return 0, 0, nil
+	return 0, 0, w.balErr
 }
 
 func (w *TXCWallet) Fund(v uint64, _ *dex.Asset) (asset.Coins, error) {
@@ -448,7 +460,7 @@ func (w *TXCWallet) Address() (string, error) {
 }
 
 func (w *TXCWallet) Unlock(pw string, dur time.Duration) error {
-	return nil
+	return w.unlockErr
 }
 
 func (w *TXCWallet) Lock() error {
@@ -483,18 +495,19 @@ func (w *TXCWallet) setConfs(confs uint32) {
 	w.mtx.Unlock()
 }
 
-type tCrypter struct{}
+type tCrypter struct {
+	encryptErr error
+	decryptErr error
+	recryptErr error
+}
 
-func (c *tCrypter) Encrypt(b []byte) ([]byte, error) { return b, nil }
+func (c *tCrypter) Encrypt(b []byte) ([]byte, error) { return b, c.encryptErr }
 
-func (c *tCrypter) Decrypt(b []byte) ([]byte, error) { return b, nil }
+func (c *tCrypter) Decrypt(b []byte) ([]byte, error) { return b, c.decryptErr }
 
 func (c *tCrypter) Serialize() []byte { return nil }
 
 func (c *tCrypter) Close() {}
-
-func tNewCrypter(string) encrypt.Crypter                 { return &tCrypter{} }
-func tReCrypter(string, []byte) (encrypt.Crypter, error) { return &tCrypter{}, nil }
 
 var tAssetID uint32
 
@@ -511,24 +524,32 @@ func randomMsgMarket() (baseAsset, quoteAsset *msgjson.Asset) {
 }
 
 type testRig struct {
-	core *Core
-	db   *TDB
-	ws   *TWebsocket
-	dc   *dexConnection
-	acct *dexAccount
+	core    *Core
+	db      *TDB
+	queue   *wait.TickerQueue
+	ws      *TWebsocket
+	dc      *dexConnection
+	acct    *dexAccount
+	crypter *tCrypter
 }
 
 func newTestRig() *testRig {
 	db := new(TDB)
 
+	// Set the global waiter expiration, and start the waiter.
+	txWaitExpiration = time.Millisecond * 10
+	queue := wait.NewTickerQueue(time.Millisecond * 5)
+	go queue.Run(tCtx)
+
 	dc, conn, acct := testDexConnection()
 
-	// Store the
+	crypter := &tCrypter{}
 
 	return &testRig{
 		core: &Core{
-			ctx: tCtx,
-			db:  db,
+			ctx:      tCtx,
+			db:       db,
+			latencyQ: queue,
 			conns: map[string]*dexConnection{
 				tDexUrl: dc,
 			},
@@ -541,13 +562,15 @@ func newTestRig() *testRig {
 			wsConstructor: func(*comms.WsCfg) (comms.WsConn, error) {
 				return conn, nil
 			},
-			newCrypter: tNewCrypter,
-			reCrypter:  tReCrypter,
+			newCrypter: func(string) encrypt.Crypter { return crypter },
+			reCrypter:  func(string, []byte) (encrypt.Crypter, error) { return crypter, crypter.recryptErr },
 		},
-		db:   db,
-		ws:   conn,
-		dc:   dc,
-		acct: acct,
+		db:      db,
+		queue:   queue,
+		ws:      conn,
+		dc:      dc,
+		acct:    acct,
+		crypter: crypter,
 	}
 }
 
@@ -579,7 +602,7 @@ func TestMarkets(t *testing.T) {
 	marketIDs := make(map[string]struct{})
 	for i := 0; i < 10; i++ {
 		base, quote := randomMsgMarket()
-		marketIDs[sid(base.ID, quote.ID)] = struct{}{}
+		marketIDs[mktID(base.ID, quote.ID)] = struct{}{}
 		cfg := rig.dc.cfg
 		cfg.Markets = append(cfg.Markets, msgjson.Market{
 			Name:            base.Symbol + quote.Symbol,
@@ -601,7 +624,7 @@ func TestMarkets(t *testing.T) {
 	assets := rig.dc.assets
 	for _, xc := range xcs {
 		for _, market := range xc.Markets {
-			mkt := sid(market.BaseID, market.QuoteID)
+			mkt := mktID(market.BaseID, market.QuoteID)
 			_, found := marketIDs[mkt]
 			if !found {
 				t.Fatalf("market %s not found", mkt)
@@ -749,41 +772,68 @@ func TestCreateWallet(t *testing.T) {
 		Account: "default",
 	}
 
-	// Try to add an existing wallet.
-	wallet, _ := newTWallet(tILT.ID)
-	tCore.wallets[tILT.ID] = wallet
-	err := tCore.CreateWallet(tPW, wPW, form)
-	if err == nil {
-		t.Fatalf("no error for existing wallet")
+	ensureErr := func(tag string) {
+		err := tCore.CreateWallet(tPW, wPW, form)
+		if err == nil {
+			t.Fatalf("no %s error", tag)
+		}
 	}
+
+	// Try to add an existing wallet.
+	wallet, tWallet := newTWallet(tILT.ID)
+	tCore.wallets[tILT.ID] = wallet
+	ensureErr("existing wallet")
 	delete(tCore.wallets, tILT.ID)
 
+	// Failure to retrieve encryption key params.
+	rig.db.encKeyErr = tErr
+	ensureErr("db.Get")
+	rig.db.encKeyErr = nil
+
+	// Crypter error.
+	rig.crypter.encryptErr = tErr
+	ensureErr("Encrypt")
+	rig.crypter.encryptErr = nil
+
 	// Try an unknown wallet (not yet asset.Register'ed).
-	err = tCore.CreateWallet(tPW, wPW, form)
-	if err == nil {
-		t.Fatalf("no error for unknown asset")
-	}
+	ensureErr("unregistered asset")
 
 	// Register the asset.
 	asset.Register(tILT.ID, &tDriver{
 		f: func(wCfg *asset.WalletConfig, logger dex.Logger, net dex.Network) (asset.Wallet, error) {
-			w, _ := newTWallet(tILT.ID)
-			return w.Wallet, nil
+			return wallet.Wallet, nil
 		},
 		winfo: &asset.WalletInfo{},
 	})
 
+	// Connection error.
+	tWallet.connectErr = tErr
+	ensureErr("Connect")
+	tWallet.connectErr = nil
+
+	// Unlock error.
+	tWallet.unlockErr = tErr
+	ensureErr("Unlock")
+	tWallet.unlockErr = nil
+
+	// Address error.
+	tWallet.addrErr = tErr
+	ensureErr("Address")
+	tWallet.addrErr = nil
+
+	// Balance error.
+	tWallet.balErr = tErr
+	ensureErr("Balance")
+	tWallet.balErr = nil
+
 	// Database error.
 	rig.db.updateWalletErr = tErr
-	err = tCore.CreateWallet(tPW, wPW, form)
-	if err == nil {
-		t.Fatalf("no error for database error")
-	}
+	ensureErr("db.UpdateWallet")
 	rig.db.updateWalletErr = nil
 
 	// Success
 	delete(tCore.wallets, tILT.ID)
-	err = tCore.CreateWallet(tPW, wPW, form)
+	err := tCore.CreateWallet(tPW, wPW, form)
 	if err != nil {
 		t.Fatalf("error when should be no error: %v", err)
 	}
@@ -813,7 +863,6 @@ func TestRegister(t *testing.T) {
 	}
 	sign(tDexPriv, regRes)
 
-	var timer *time.Timer
 	queueRegister := func() {
 		rig.ws.queueResponse(msgjson.RegisterRoute, func(msg *msgjson.Message, f msgFunc) error {
 			resp, _ := msgjson.NewResponse(msg.ID, regRes, nil)
@@ -874,37 +923,52 @@ func TestRegister(t *testing.T) {
 	}
 
 	form := &Registration{
-		DEX:      tDexUrl,
+		URL:      tDexUrl,
 		Password: tPW,
 		Fee:      tFee,
 	}
 
 	tWallet.payFeeCoin = &tCoin{id: []byte("abcdef")}
 
+	ch := tCore.NotificationFeed()
+
 	var err error
-	run := func() <-chan error {
-		if timer != nil {
-			timer.Stop()
-		}
+	run := func() {
 		tWallet.setConfs(tDCR.FundConf)
-		// No errors
-		var errChan <-chan error
-		err, errChan = tCore.Register(form)
-		return errChan
+		err = tCore.Register(form)
 	}
 
-	runWithWait := func() {
-		errChan := run()
-		if err != nil {
-			t.Fatalf("runWithWait error: %v", err)
+	getFeeNote := func() *FeePaymentNote {
+		select {
+		case n := <-ch:
+			switch note := n.(type) {
+			case *FeePaymentNote:
+				return note
+			default:
+				t.Fatalf("wrong notification type: %T", note)
+			}
+			// When it works, it should be virtually instant, but I have seen it fail
+			// at 1 millisecond.
+		case <-time.NewTimer(time.Second).C:
+			t.Fatalf("timed out waiting for fee payment notification")
 		}
-		err = <-errChan
+		return nil
 	}
 
 	queueResponses()
-	runWithWait()
+	run()
 	if err != nil {
 		t.Fatalf("registration error: %v", err)
+	}
+	// Should be two success notifications. One for fee paid on-chain, one for
+	// fee notification sent.
+	feeNote := getFeeNote()
+	if feeNote.Severity() != db.Success {
+		t.Fatalf("fee payment error notification: %s: %s", feeNote.Subject(), feeNote.Details())
+	}
+	feeNote = getFeeNote()
+	if feeNote.Severity() != db.Success {
+		t.Fatalf("fee payment error notification: %s: %s", feeNote.Subject(), feeNote.Details())
 	}
 
 	// wallet not found
@@ -996,16 +1060,32 @@ func TestRegister(t *testing.T) {
 		f(m)
 		return nil
 	})
-	runWithWait()
-	if err == nil {
-		t.Fatalf("no error for notifyfee response error")
+	run()
+	// This should not return a registration error, but the 2nd FeePaymentNote
+	// should indicate an error.
+	if err != nil {
+		t.Fatalf("error for notifyfee response error: %v", err)
+	}
+	// 1st note is fee sent.
+	feeNote = getFeeNote()
+	if feeNote.Severity() != db.Success {
+		t.Fatalf("fee payment error notification: %s: %s", feeNote.Subject(), feeNote.Details())
+	}
+	// 2nd note is fee error
+	feeNote = getFeeNote()
+	if feeNote.Severity() != db.ErrorLevel {
+		t.Fatalf("non-error fee payment notification for notifyfee response error: %s: %s", feeNote.Subject(), feeNote.Details())
 	}
 
 	// Make sure it's good again.
 	queueResponses()
-	runWithWait()
+	run()
 	if err != nil {
 		t.Fatalf("error after regaining valid state: %v", err)
+	}
+	feeNote = getFeeNote()
+	if feeNote.Severity() != db.Success {
+		t.Fatalf("fee payment error notification: %s: %s", feeNote.Subject(), feeNote.Details())
 	}
 }
 
@@ -1025,7 +1105,7 @@ func TestLogin(t *testing.T) {
 	}
 
 	queueSuccess()
-	err := tCore.Login(tPW)
+	_, err := tCore.Login(tPW)
 	if err != nil {
 		t.Fatalf("initial Login error: %v", err)
 	}
@@ -1033,7 +1113,7 @@ func TestLogin(t *testing.T) {
 	// No encryption key.
 	rig.acct.unauth()
 	rig.db.encKeyErr = tErr
-	err = tCore.Login(tPW)
+	_, err = tCore.Login(tPW)
 	if err == nil {
 		t.Fatalf("no error for missing app key")
 	}
@@ -1041,7 +1121,7 @@ func TestLogin(t *testing.T) {
 
 	// Account not Paid. No error, and account should be unlocked.
 	rig.acct.isPaid = false
-	err = tCore.Login(tPW)
+	_, err = tCore.Login(tPW)
 	if err != nil {
 		t.Fatalf("error for unpaid account: %v", err)
 	}
@@ -1057,7 +1137,7 @@ func TestLogin(t *testing.T) {
 		f(resp)
 		return nil
 	})
-	err = tCore.Login(tPW)
+	_, err = tCore.Login(tPW)
 	if err == nil {
 		t.Fatalf("no error for 'connect' route error")
 	}
@@ -1065,7 +1145,7 @@ func TestLogin(t *testing.T) {
 	// Success again.
 	rig.acct.unauth()
 	queueSuccess()
-	err = tCore.Login(tPW)
+	_, err = tCore.Login(tPW)
 	if err != nil {
 		t.Fatalf("final Login error: %v", err)
 	}
@@ -1493,7 +1573,7 @@ func TestCancel(t *testing.T) {
 		Order: lo,
 	}
 	oid := lo.ID()
-	tracker := newTrackedTrade(dbOrder, preImg, dc, rig.db, nil, nil)
+	tracker := newTrackedTrade(dbOrder, preImg, dc, rig.db, rig.queue, nil, nil, rig.core.notify)
 	dc.trades[oid] = tracker
 
 	handleCancel := func(msg *msgjson.Message, f msgFunc) error {
@@ -1561,6 +1641,7 @@ func TestHandlePreimageRequest(t *testing.T) {
 	tracker := &trackedTrade{
 		Order:  ord,
 		preImg: preImg,
+		dc:     rig.dc,
 	}
 	rig.dc.trades[oid] = tracker
 	err := handlePreimageRequest(rig.core, rig.dc, req)
@@ -1582,6 +1663,51 @@ func TestHandlePreimageRequest(t *testing.T) {
 	rig.ws.sendErr = tErr
 	ensureErr("send error")
 	rig.ws.sendErr = nil
+}
+
+func TestHandleRevokeMatchMsg(t *testing.T) {
+	rig := newTestRig()
+	ord := &order.LimitOrder{P: order.Prefix{ServerTime: time.Now()}}
+	oid := ord.ID()
+	preImg := newPreimage()
+	payload := &msgjson.RevokeMatch{
+		OrderID: oid[:],
+		MatchID: encode.RandomBytes(order.MatchIDSize),
+	}
+	req, _ := msgjson.NewRequest(rig.dc.NextID(), msgjson.RevokeMatchRoute, payload)
+
+	// Ensure revoking a non-existent order generates an error.
+	err := handleRevokeMatchMsg(rig.core, rig.dc, req)
+	if err == nil {
+		t.Fatal("[handleRevokeMatchMsg] expected a non-existent order")
+	}
+
+	tracker := &trackedTrade{
+		db: rig.db,
+		metaData: &db.OrderMetaData{
+			Status: order.OrderStatusBooked,
+		},
+		Order:  ord,
+		preImg: preImg,
+		dc:     rig.dc,
+	}
+	rig.dc.trades[oid] = tracker
+
+	err = handleRevokeMatchMsg(rig.core, rig.dc, req)
+	if err != nil {
+		t.Fatalf("handleRevokeMatchMsg error: %v", err)
+	}
+
+	// Ensure the order status has been updated to revoked.
+	tracker, _, _ = rig.dc.findOrder(oid)
+	if tracker == nil {
+		t.Fatalf("expected to find an order with id %s", oid.String())
+	}
+
+	if tracker.metaData.Status != order.OrderStatusRevoked {
+		t.Fatalf("expected a revoked order status, got %v",
+			tracker.metaData.Status)
+	}
 }
 
 func TestTradeTracking(t *testing.T) {
@@ -1637,7 +1763,7 @@ func TestTradeTracking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walletSet error: %v", err)
 	}
-	tracker := newTrackedTrade(dbOrder, preImgL, dc, rig.db, walletSet, nil)
+	tracker := newTrackedTrade(dbOrder, preImgL, dc, rig.db, rig.queue, walletSet, nil, rig.core.notify)
 	rig.dc.trades[tracker.ID()] = tracker
 	var match *matchTracker
 	checkStatus := func(tag string, wantStatus order.MatchStatus) {
@@ -1698,6 +1824,21 @@ func TestTradeTracking(t *testing.T) {
 	err = handleAuditRoute(tCore, rig.dc, msg)
 	if err == nil {
 		t.Fatalf("no maker error for AuditContract error")
+	}
+
+	// Check expiration error.
+	tBtcWallet.auditErr = asset.CoinNotFoundError
+	err = handleAuditRoute(tCore, rig.dc, msg)
+	if err == nil {
+		t.Fatalf("no maker error for AuditContract expiration")
+	}
+	var errSet *errorSet
+	if !errors.As(err, &errSet) {
+		t.Fatalf("unexpected error type")
+	}
+	var expErr ExpirationErr
+	if !errors.As(errSet.errs[0], &expErr) {
+		t.Fatalf("wrong error type. expecting ExpirationTimeout, got %T: %v", errSet.errs[0], errSet.errs[0])
 	}
 	tBtcWallet.auditErr = nil
 
@@ -1923,6 +2064,22 @@ func TestTradeTracking(t *testing.T) {
 	}
 }
 
+func TestNotifications(t *testing.T) {
+	tCore := newTestRig().core
+
+	// Insert a notification into the database.
+	typedNote := newOrderNote("abc", "def", 100, nil)
+
+	ch := tCore.NotificationFeed()
+	tCore.notify(typedNote)
+	select {
+	case n := <-ch:
+		dbtest.MustCompareNotifications(t, n.DBNote(), &typedNote.Notification)
+	default:
+		t.Fatalf("no notification received over the notification channel")
+	}
+}
+
 func convertMsgLimitOrder(msgOrder *msgjson.LimitOrder) *order.LimitOrder {
 	tif := order.ImmediateTiF
 	if msgOrder.TiF == msgjson.StandingOrderNum {
@@ -2032,4 +2189,124 @@ func tMsgAudit(oid order.OrderID, mid order.MatchID, recipient string, val uint6
 		secretHash: secretHash,
 	}
 	return audit, auditInfo
+}
+
+func TestHandleEpochOrderMsg(t *testing.T) {
+	rig := newTestRig()
+	ord := &order.LimitOrder{P: order.Prefix{ServerTime: time.Now()}}
+	oid := ord.ID()
+	mid := hex.EncodeToString(encode.RandomBytes(order.OrderIDSize))
+	payload := &msgjson.EpochOrderNote{
+		BookOrderNote: msgjson.BookOrderNote{
+			OrderNote: msgjson.OrderNote{
+				MarketID: mid,
+				OrderID:  oid.Bytes(),
+			},
+			TradeNote: msgjson.TradeNote{
+				Side:     msgjson.BuyOrderNum,
+				Rate:     4,
+				Quantity: 10,
+			},
+		},
+		Epoch: 1,
+	}
+
+	req, _ := msgjson.NewRequest(rig.dc.NextID(), msgjson.EpochOrderRoute, payload)
+
+	// Ensure handling an epoch order associated with a non-existent orderbook
+	// generates an error.
+	err := handleEpochOrderMsg(rig.core, rig.dc, req)
+	if err == nil {
+		t.Fatal("[handleEpochOrderMsg] expected a non-existent orderbook error")
+	}
+
+	rig.dc.books[mid] = book.NewOrderBook()
+
+	err = handleEpochOrderMsg(rig.core, rig.dc, req)
+	if err != nil {
+		t.Fatalf("[handleEpochOrderMsg] unexpected error: %v", err)
+	}
+
+	payload.Epoch = 2
+	req, _ = msgjson.NewRequest(rig.dc.NextID(), msgjson.EpochOrderRoute, payload)
+
+	// Ensure receiving an epoch order with a different epoch resets the queue.
+	err = handleEpochOrderMsg(rig.core, rig.dc, req)
+	if err != nil {
+		t.Fatalf("[handleEpochOrderMsg] unexpected error: %v", err)
+	}
+
+	epochSize := rig.dc.books[mid].EpochSize()
+	if epochSize != 1 {
+		t.Fatalf("[handleEpochOrderMsg] expected an epoch size of 1, got %d",
+			epochSize)
+	}
+}
+
+func makeMatchProof(preimages []order.Preimage, commitments []order.Commitment) (msgjson.Bytes, msgjson.Bytes, error) {
+	if len(preimages) != len(commitments) {
+		return nil, nil, fmt.Errorf("expected equal number of preimages and commitments")
+	}
+
+	sbuff := make([]byte, 0, len(preimages)*order.PreimageSize)
+	cbuff := make([]byte, 0, len(commitments)*order.CommitmentSize)
+	for i := 0; i < len(preimages); i++ {
+		sbuff = append(sbuff, preimages[i][:]...)
+		cbuff = append(cbuff, commitments[i][:]...)
+	}
+	seed := blake256.Sum256(sbuff)
+	csum := blake256.Sum256(cbuff)
+	return seed[:], csum[:], nil
+}
+
+func TestHandleMatchProofMsg(t *testing.T) {
+	rig := newTestRig()
+	mid := hex.EncodeToString(encode.RandomBytes(order.OrderIDSize))
+	pimg := newPreimage()
+	cmt := pimg.Commit()
+
+	seed, csum, err := makeMatchProof([]order.Preimage{pimg}, []order.Commitment{cmt})
+	if err != nil {
+		t.Fatalf("[makeMatchProof] unexpected error: %v", err)
+	}
+
+	payload := &msgjson.MatchProofNote{
+		MarketID:  mid,
+		Epoch:     1,
+		Preimages: []dex.Bytes{pimg[:]},
+		CSum:      csum[:],
+		Seed:      seed[:],
+	}
+
+	eo := &msgjson.EpochOrderNote{
+		BookOrderNote: msgjson.BookOrderNote{
+			OrderNote: msgjson.OrderNote{
+				MarketID: mid,
+				OrderID:  encode.RandomBytes(order.OrderIDSize),
+			},
+		},
+		Epoch:  1,
+		Commit: cmt[:],
+	}
+
+	req, _ := msgjson.NewRequest(rig.dc.NextID(), msgjson.MatchProofRoute, payload)
+
+	// Ensure match proof validation generates an error for a non-existent
+	// orderbook generates an error.
+	err = handleMatchProofMsg(rig.core, rig.dc, req)
+	if err == nil {
+		t.Fatal("[handleMatchProofMsg] expected a non-existent orderbook error")
+	}
+
+	rig.dc.books[mid] = book.NewOrderBook()
+
+	err = rig.dc.books[mid].Enqueue(eo)
+	if err != nil {
+		t.Fatalf("[Enqueue] unexpected error: %v", err)
+	}
+
+	err = handleMatchProofMsg(rig.core, rig.dc, req)
+	if err != nil {
+		t.Fatalf("[handleMatchProofMsg] unexpected error: %v", err)
+	}
 }
