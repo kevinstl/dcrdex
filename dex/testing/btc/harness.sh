@@ -54,6 +54,9 @@ cd ${NODES_ROOT} && tmux new-session -d -s $SESSION
 # These config files aren't actually used here, but can be used by other
 # programs. I would use them here, but bitcoind seems to have some issues
 # reading from the file when using regtest.
+# Put settings for regtest under regtest option group to fix this:
+#[regtest]
+#rpcport=20575
 
 cat > "${HARNESS_DIR}/alpha.conf" <<EOF
 rpcuser=user
