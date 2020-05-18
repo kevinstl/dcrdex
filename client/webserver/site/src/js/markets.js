@@ -29,6 +29,8 @@ check.classList.add('ico-check')
 export default class MarketsPage extends BasePage {
   constructor (application, main, data) {
     super()
+
+    console.debug('debug1!!')
     app = application
     const page = this.page = Doc.parsePage(main, [
       // Templates, loaders, chart div...
@@ -405,6 +407,9 @@ export default class MarketsPage extends BasePage {
     this.handleBook(data)
     page.marketLoader.classList.add('d-none')
     const url = market.dex.url
+
+    console.debug(`this.marketRows: ${this.marketRows}`)
+
     this.marketRows.forEach(row => {
       const d = row.dataset
       if (d.dex === url && parseInt(d.base) === data.base && parseInt(d.quote) === data.quote) {

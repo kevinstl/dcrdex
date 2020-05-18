@@ -41,6 +41,7 @@ export default class Application {
    * point. Read the id = main element and attach handlers.
    */
   async start () {
+    console.error('debug1!!')
     // The "user" is a large data structure that contains nearly all state
     // information, including exchanges, markets, wallets, and orders. It must
     // be loaded immediately.

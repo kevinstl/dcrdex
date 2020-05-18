@@ -323,6 +323,9 @@ func (d *ExchangeWallet) Info() *asset.WalletInfo {
 // interface.
 func (dcr *ExchangeWallet) Connect(ctx context.Context) (error, *sync.WaitGroup) {
 	err := dcr.client.Connect(ctx, false)
+
+	//dcr.log.Infof("ctx: ", err)
+
 	if err != nil {
 		return fmt.Errorf("Decred Wallet connect error: %v", err), nil
 	}

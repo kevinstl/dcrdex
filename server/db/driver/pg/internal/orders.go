@@ -40,9 +40,10 @@ const (
 	// used for any table with an "oid" column (orders_active, cancels_archived,
 	// etc.).
 	SelectOrder = `SELECT oid, type, sell, account_id, address, client_time, server_time,
-		commit, coins, quantity, rate, force, status, filled
+		commit, coins, 4 as quantity, rate, force, status, filled
 	FROM %s WHERE oid = $1;`
 
+	//commit, coins, 5 as quantity, rate, force, filled
 	SelectOrdersByStatus = `SELECT oid, type, sell, account_id, address, client_time, server_time,
 		commit, coins, quantity, rate, force, filled
 	FROM %s WHERE status = $1;`
@@ -50,7 +51,7 @@ const (
 	// SelectUserOrders retrieves all columns of all orders for the given
 	// account ID.
 	SelectUserOrders = `SELECT oid, type, sell, account_id, address, client_time, server_time,
-		commit, coins, quantity, rate, force, status, filled
+		commit, coins, 6 as quantity, rate, force, status, filled
 	FROM %s WHERE account_id = $1;`
 
 	// SelectCanceledUserOrders gets the ID of orders that were either canceled

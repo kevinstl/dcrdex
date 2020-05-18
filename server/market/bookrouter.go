@@ -311,6 +311,8 @@ out:
 				panic(fmt.Sprintf("unknown orderbook update action %d", u.action))
 			}
 
+			log.Info("note: %+v", note)
+
 			r.sendNote(route, subs, note)
 		case <-ctx.Done():
 			break out
@@ -320,6 +322,7 @@ out:
 
 // sendBook encodes and sends the the entire order book to the specified client.
 func (r *BookRouter) sendBook(conn comms.Link, book *msgBook, msgID uint64) {
+
 	seq := book.subs.lastSeq()
 	book.mtx.RLock()
 	msgBook := make([]*msgjson.BookOrderNote, 0, len(book.orders))
@@ -339,6 +342,8 @@ func (r *BookRouter) sendBook(conn comms.Link, book *msgBook, msgID uint64) {
 		log.Errorf("error encoding 'orderbook' response: %v", err)
 		return
 	}
+
+	log.Info("msg: %+v", msg)
 
 	err = conn.Send(msg)
 	if err != nil {
@@ -420,6 +425,9 @@ func (r *BookRouter) handleUnsubOrderBook(conn comms.Link, msg *msgjson.Message)
 
 // sendNote sends a notification to the specified subscribers.
 func (r *BookRouter) sendNote(route string, subs *subscribers, note interface{}) {
+
+	log.Info("debug1")
+
 	msg, err := msgjson.NewNotification(route, note)
 	if err != nil {
 		log.Errorf("error creating notification-type Message: %v", err)
