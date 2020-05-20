@@ -46,7 +46,7 @@ export default class MarketsPage extends BasePage {
       'forms', 'openForm', 'walletPass',
       // Order submission is verified with the user's password.
       'verifyForm', 'vSide', 'vQty', 'vBase', 'vRate',
-      'vTotal', 'vQuote', 'vPass', 'vSubmit', 'verifyLimit', 'verifyMarket',
+      'vTotal', 'vQuote', 'vPass', 'vSubmit', 'verifyLimit', 'verifyMarket', 'verifyOrderErr',
       'vmTotal', 'vmAsset', 'vmLots', 'mktBuyScore',
       // Create wallet form
       'walletForm', 'acctName',
@@ -308,6 +308,12 @@ export default class MarketsPage extends BasePage {
       return false
     }
     return true
+  }
+
+  /* clearPasswordField */
+  clearPasswordField () {
+    const page = this.page
+    page.vPass.value = ''
   }
 
   /* handleBook accepts the data sent in the 'book' notification. */
@@ -674,18 +680,29 @@ export default class MarketsPage extends BasePage {
   async submitOrder () {
     const page = this.page
     const market = this.market
-    Doc.hide(page.forms)
+    var success = true
+    // Doc.hide(page.forms)
+    Doc.hide(page.verifyOrderErr)
     const order = this.parseOrder()
     const pw = page.vPass.value
-    page.vPass.textContent = ''
+    // page.vPass.value = ''
     const req = {
       order: order,
       pw: pw
     }
-    if (!this.validateOrder(order)) return
+    if (!this.validateOrder(order)) {
+      this.clearPasswordField()
+      return
+    }
     var res = await postJSON('/api/trade', req)
     app.loaded()
-    if (!app.checkResponse(res)) return
+    if (!app.checkResponse(res)) {
+      success = false
+      page.verifyOrderErr.textContent = 'Request Failed, See Notification Drop Down'
+      Doc.show(page.verifyOrderErr)
+      // this.clearPasswordField()
+      return
+    }
     // If the wallets are not open locally, they must have been opened during
     // ordering. Grab updated info.
     const baseWallet = app.walletMap[market.base.id]
@@ -697,6 +714,10 @@ export default class MarketsPage extends BasePage {
     }
     app.orders(order.dex, order.base, order.quote).push(res.order)
     this.refreshActiveOrders()
+    if (success) {
+      this.clearPasswordField()
+      Doc.hide(page.forms)
+    }
   }
 
   /*
