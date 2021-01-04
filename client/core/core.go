@@ -2760,7 +2760,7 @@ func (c *Core) AccountImport(pw []byte, account Account) error {
 	if err != nil {
 		return err
 	}
-
+	c.refreshUser()
 	return nil
 }
 
